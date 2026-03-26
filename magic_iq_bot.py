@@ -218,7 +218,7 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
@@ -226,6 +226,7 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("MAGIC-IQ")
+log.setLevel(logging.INFO)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TG_SESSION      = os.getenv("TG_SESSION", "")
@@ -352,29 +353,69 @@ def parse_result(text: str):
 
 # ── ASSET MAPS ────────────────────────────────────────────────────────────────
 ASSET_MAP = {
-    "EUR/AUD": "EURAUD-OTC", "EUR/USD": "EURUSD-OTC", "EUR/GBP": "EURGBP-OTC",
-    "EUR/JPY": "EURJPY-OTC", "EUR/CHF": "EURCHF-OTC", "EUR/CAD": "EURCAD-OTC",
+    # Major EUR pairs
+    "EUR/USD": "EURUSD-OTC", "EUR/GBP": "EURGBP-OTC", "EUR/JPY": "EURJPY-OTC",
+    "EUR/CHF": "EURCHF-OTC", "EUR/CAD": "EURCAD-OTC", "EUR/AUD": "EURAUD-OTC",
+    "EUR/NZD": "EURNZD-OTC", "EUR/SGD": "EURSGD-OTC", "EUR/NOK": "EURNOK-OTC",
+    "EUR/SEK": "EURSEK-OTC", "EUR/DKK": "EURDKK-OTC", "EUR/PLN": "EURPLN-OTC",
+    "EUR/HUF": "EURHUF-OTC", "EUR/TRY": "EURTRY-OTC", "EUR/ZAR": "EURZAR-OTC",
+    # Major GBP pairs
     "GBP/USD": "GBPUSD-OTC", "GBP/JPY": "GBPJPY-OTC", "GBP/CHF": "GBPCHF-OTC",
-    "GBP/AUD": "GBPAUD-OTC", "GBP/CAD": "GBPCAD-OTC",
+    "GBP/AUD": "GBPAUD-OTC", "GBP/CAD": "GBPCAD-OTC", "GBP/NZD": "GBPNZD-OTC",
+    "GBP/SGD": "GBPSGD-OTC", "GBP/MXN": "GBPMXN-OTC",
+    # Major USD pairs
     "USD/JPY": "USDJPY-OTC", "USD/CHF": "USDCHF-OTC", "USD/CAD": "USDCAD-OTC",
-    "AUD/USD": "AUDUSD-OTC", "AUD/JPY": "AUDJPY-OTC",
-    "NZD/USD": "NZDUSD-OTC", "USD/BRL": "USDBRL-OTC",
-    "NZD/JPY": "NZDJPY-OTC", "CAD/JPY": "CADJPY-OTC",
-    "AUD/CAD": "AUDCAD-OTC", "AUD/NZD": "AUDNZD-OTC",
-    "XAUUSD":  "XAUUSD-OTC", "GOLD":    "XAUUSD-OTC", "XAU/USD": "XAUUSD-OTC",
+    "USD/BRL": "USDBRL-OTC", "USD/MXN": "USDMXN-OTC", "USD/NOK": "USDNOK-OTC",
+    "USD/SEK": "USDSEK-OTC", "USD/DKK": "USDDKK-OTC", "USD/ZAR": "USDZAR-OTC",
+    "USD/TRY": "USDTRY-OTC", "USD/HUF": "USDHUF-OTC", "USD/PLN": "USDPLN-OTC",
+    "USD/CZK": "USDCZK-OTC", "USD/THB": "USDTHB-OTC", "USD/HKD": "USDHKD-OTC",
+    "USD/INR": "USDINR-OTC", "USD/IDR": "USDIDR-OTC", "USD/MYR": "USDMYR-OTC",
+    "USD/PHP": "USDPHP-OTC", "USD/CNH": "USDCNH-OTC", "USD/SGD": "USDSGD-OTC",
+    # AUD pairs
+    "AUD/USD": "AUDUSD-OTC", "AUD/JPY": "AUDJPY-OTC", "AUD/CAD": "AUDCAD-OTC",
+    "AUD/NZD": "AUDNZD-OTC", "AUD/CHF": "AUDCHF-OTC",
+    # NZD pairs
+    "NZD/USD": "NZDUSD-OTC", "NZD/JPY": "NZDJPY-OTC", "NZD/CAD": "NZDCAD-OTC",
+    "NZD/CHF": "NZDCHF-OTC",
+    # Cross pairs
+    "CAD/JPY": "CADJPY-OTC", "CHF/JPY": "CHFJPY-OTC",
+    # Metals (order matters — longer keys first for matching)
+    "XAU/USD": "XAUUSD-OTC", "XAG/USD": "XAGUSD-OTC",
+    "XAUUSD":  "XAUUSD-OTC", "XAGUSD":  "XAGUSD-OTC",
+    "GOLD":    "XAUUSD-OTC", "SILVER":  "XAGUSD-OTC",
 }
 
 LIVE_ASSET_MAP = {
-    "EUR/AUD": "EURAUD", "EUR/USD": "EURUSD", "EUR/GBP": "EURGBP",
-    "EUR/JPY": "EURJPY", "EUR/CHF": "EURCHF", "EUR/CAD": "EURCAD",
+    # Major EUR pairs
+    "EUR/USD": "EURUSD", "EUR/GBP": "EURGBP", "EUR/JPY": "EURJPY",
+    "EUR/CHF": "EURCHF", "EUR/CAD": "EURCAD", "EUR/AUD": "EURAUD",
+    "EUR/NZD": "EURNZD", "EUR/SGD": "EURSGD", "EUR/NOK": "EURNOK",
+    "EUR/SEK": "EURSEK", "EUR/DKK": "EURDKK", "EUR/PLN": "EURPLN",
+    "EUR/HUF": "EURHUF", "EUR/TRY": "EURTRY", "EUR/ZAR": "EURZAR",
+    # Major GBP pairs
     "GBP/USD": "GBPUSD", "GBP/JPY": "GBPJPY", "GBP/CHF": "GBPCHF",
-    "GBP/AUD": "GBPAUD", "GBP/CAD": "GBPCAD",
+    "GBP/AUD": "GBPAUD", "GBP/CAD": "GBPCAD", "GBP/NZD": "GBPNZD",
+    "GBP/SGD": "GBPSGD", "GBP/MXN": "GBPMXN",
+    # Major USD pairs
     "USD/JPY": "USDJPY", "USD/CHF": "USDCHF", "USD/CAD": "USDCAD",
-    "AUD/USD": "AUDUSD", "AUD/JPY": "AUDJPY",
-    "NZD/USD": "NZDUSD", "USD/BRL": "USDBRL",
-    "NZD/JPY": "NZDJPY", "CAD/JPY": "CADJPY",
-    "AUD/CAD": "AUDCAD", "AUD/NZD": "AUDNZD",
-    "XAUUSD":  "XAUUSD", "GOLD":    "XAUUSD", "XAU/USD": "XAUUSD",
+    "USD/BRL": "USDBRL", "USD/MXN": "USDMXN", "USD/NOK": "USDNOK",
+    "USD/SEK": "USDSEK", "USD/DKK": "USDDKK", "USD/ZAR": "USDZAR",
+    "USD/TRY": "USDTRY", "USD/HUF": "USDHUF", "USD/PLN": "USDPLN",
+    "USD/CZK": "USDCZK", "USD/THB": "USDTHB", "USD/HKD": "USDHKD",
+    "USD/INR": "USDINR", "USD/IDR": "USDIDR", "USD/MYR": "USDMYR",
+    "USD/PHP": "USDPHP", "USD/CNH": "USDCNH", "USD/SGD": "USDSGD",
+    # AUD pairs
+    "AUD/USD": "AUDUSD", "AUD/JPY": "AUDJPY", "AUD/CAD": "AUDCAD",
+    "AUD/NZD": "AUDNZD", "AUD/CHF": "AUDCHF",
+    # NZD pairs
+    "NZD/USD": "NZDUSD", "NZD/JPY": "NZDJPY", "NZD/CAD": "NZDCAD",
+    "NZD/CHF": "NZDCHF",
+    # Cross pairs
+    "CAD/JPY": "CADJPY", "CHF/JPY": "CHFJPY",
+    # Metals
+    "XAU/USD": "XAUUSD", "XAG/USD": "XAGUSD",
+    "XAUUSD":  "XAUUSD", "XAGUSD":  "XAGUSD",
+    "GOLD":    "XAUUSD", "SILVER":  "XAGUSD",
 }
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -483,12 +524,15 @@ def parse_magic_trader(text: str):
     upper = t.upper()
 
     if any(x in upper for x in ["GAIN", "LOSS", "WIN", "DIRECT WIN"]):
-        return None
+        return None  # result message, not a signal
+
     if "expiration" not in t.lower() and "expiry" not in t.lower():
+        log.debug("SKIP (no expiration/expiry keyword)")
         return None
 
     exp = re.search(r"(\d+)[- ]minute", t, re.IGNORECASE)
     if not exp:
+        log.warning(f"SKIP — no expiry minutes found in: {t[:80]}")
         return None
     expiry_min = int(exp.group(1))
 
@@ -498,6 +542,7 @@ def parse_magic_trader(text: str):
             asset_key = key
             break
     if not asset_key:
+        log.warning(f"SKIP — asset not in map: {t[:80]}")
         return None
 
     direction = None
@@ -510,10 +555,12 @@ def parse_magic_trader(text: str):
     elif any(x in t for x in ["↓", "🟥"]):
         direction = "put"
     if not direction:
+        log.warning(f"SKIP — no direction (PUT/CALL) found: {t[:80]}")
         return None
 
     times = re.findall(r"\b(\d{2}:\d{2})\b", t)
     if not times:
+        log.warning(f"SKIP — no time found: {t[:80]}")
         return None
     entry_time = times[0]
 
@@ -919,8 +966,7 @@ async def on_magic_trader(event):
 
     sig = parse_magic_trader(text)
     if not sig:
-        log.info("Not a trade signal")
-        return
+        return  # reason already logged inside parse_magic_trader
 
     log.info(
         f"SIGNAL: {sig['display']} {sig['direction']} {sig['expiry_min']}min "
