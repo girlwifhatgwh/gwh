@@ -29,6 +29,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -119,6 +120,7 @@ _cancelled: set[str] = set()
 # key = f"{entry_time}_{asset_key}_g{gale_num}"
 trade_log: dict[str, dict[str, Any]] = {}
 _instance_lock_acquired = False
+_polling_conflict_handled = False
 
 
 # -----------------------------------------------------------------------------
@@ -558,6 +560,29 @@ def release_instance_lock() -> None:
 
 
 atexit.register(release_instance_lock)
+
+
+def _polling_error_callback_factory(ptb_app: Application):
+    def _on_polling_error(error: Exception) -> None:
+        global _polling_conflict_handled
+        if isinstance(error, Conflict):
+            if _polling_conflict_handled:
+                return
+            _polling_conflict_handled = True
+            log.error(
+                "Telegram polling conflict (409). "
+                "Another client is using this bot token for getUpdates. "
+                "Disabling command polling on this instance; trading listener stays online."
+            )
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(ptb_app.updater.stop())
+            except Exception as exc:
+                log.error(f"Failed to stop updater after conflict: {exc}")
+        else:
+            log.error(f"Telegram polling error: {error}")
+
+    return _on_polling_error
 
 
 # -----------------------------------------------------------------------------
@@ -1290,7 +1315,22 @@ async def main() -> None:
 
     async with ptb_app:
         await ptb_app.start()
-        await ptb_app.updater.start_polling(drop_pending_updates=True)
+        polling_enabled = os.getenv("ENABLE_COMMAND_POLLING", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if polling_enabled:
+            await ptb_app.updater.start_polling(
+                drop_pending_updates=True,
+                error_callback=_polling_error_callback_factory(ptb_app),
+            )
+        else:
+            log.warning(
+                "ENABLE_COMMAND_POLLING disabled. Bot commands/cancel buttons are off; "
+                "Magic Trader copy-trading listener remains active."
+            )
 
         while True:
             try:
