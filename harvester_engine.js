@@ -4,10 +4,13 @@
  * Pool sources (confirmed from live OpenAPI specs):
  *   DLMM  → https://dlmm.datapi.meteora.ag/pools
  *             pages 1-based, page_size up to 1000, response: { total, pages, current_page, page_size, data[] }
+ *             Already sorted volume_24h:desc — top pools are best-yield first.
  *   DAMM  → https://damm-api.meteora.ag/pools/search
  *             pages 0-based, required: page + size, response: { data[], page, total_count }
  *
  * Jupiter → https://lite-api.jup.ag/swap/v1/quote  +  /swap
+ *   Rate limit: lite endpoint is free-tier, ~10 req/s sustained.
+ *   We cap MAX_QUOTE_POOLS and add JUP_CALL_DELAY_MS between calls to stay within limits.
  */
 
 import https from 'node:https';
@@ -27,21 +30,36 @@ const DLMM_MIN_FEE_TVL = parseFloat(process.env.DLMM_MIN_FEE_TVL || '0');
 const MIN_POOL_TVL     = parseFloat(process.env.MIN_POOL_TVL     || '0');
 const MIN_POOL_VOL     = parseFloat(process.env.MIN_POOL_VOL     || '0');
 
-const SOLANA_RPC_URL    = process.env.SOLANA_RPC_URL    || 'https://api.mainnet-beta.solana.com';
-const WALLET_PUBKEY     = process.env.WALLET_PUBKEY     || '';
-const JUP_API_KEY       = process.env.JUP_API_KEY       || '';
-const HUB_URL           = process.env.HUB_URL           || '';
+const SOLANA_RPC_URL   = process.env.SOLANA_RPC_URL   || 'https://api.mainnet-beta.solana.com';
+const WALLET_PUBKEY    = process.env.WALLET_PUBKEY    || '';
+const JUP_API_KEY      = process.env.JUP_API_KEY      || '';
+const HUB_URL          = process.env.HUB_URL          || '';
 
 const HARVEST_INTERVAL_MS = parseInt(process.env.HARVEST_INTERVAL_MS || '60000', 10);
-const MAX_POOLS_PER_CYCLE = parseInt(process.env.MAX_POOLS_PER_CYCLE || '50',    10);
-const SLIPPAGE_BPS        = parseInt(process.env.SLIPPAGE_BPS        || '100',   10);
-const HARVEST_SOL_AMOUNT  = parseFloat(process.env.HARVEST_SOL_AMOUNT || '0.05');
+
+// MAX_FETCH_POOLS: how many pools to pull from each API per cycle (for pool selection)
+const MAX_FETCH_POOLS = parseInt(process.env.MAX_FETCH_POOLS || '100', 10);
+
+// MAX_QUOTE_POOLS: how many pools to actually call Jupiter quote for per cycle.
+// DLMM is already sorted volume_24h:desc so these are the highest-yield pools.
+// Keep this LOW to respect the free-tier rate limit (~10 req/s).
+const MAX_QUOTE_POOLS = parseInt(process.env.MAX_QUOTE_POOLS || '10', 10);
+
+// Delay between Jupiter quote calls in milliseconds.
+// At 300ms we stay well under 10 req/s even with retries.
+const JUP_CALL_DELAY_MS = parseInt(process.env.JUP_CALL_DELAY_MS || '300', 10);
+
+const SLIPPAGE_BPS       = parseInt(process.env.SLIPPAGE_BPS       || '100',  10);
+const HARVEST_SOL_AMOUNT = parseFloat(process.env.HARVEST_SOL_AMOUNT || '0.05');
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 // Runtime blacklist — clears on restart
 const blacklist = new Map();
+
+// Global Jupiter rate-limit state: if we hit a 429, back off across all subsequent calls.
+let jupGlobalBackoffUntil = 0;
 
 // ─────────────────────────────────────────────────────────
 // Logging
@@ -86,13 +104,13 @@ function request(urlStr, opts = {}) {
       res.on('end', () => {
         if (res.statusCode === 429) {
           return reject(Object.assign(
-            new Error('Server responded with 429 Too Many Requests.'),
+            new Error('429 Too Many Requests'),
             { status: 429 }
           ));
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
           return reject(Object.assign(
-            new Error(`Request failed with status code ${res.statusCode}: ${raw.slice(0, 200)}`),
+            new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`),
             { status: res.statusCode, body: raw }
           ));
         }
@@ -110,6 +128,7 @@ function request(urlStr, opts = {}) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// Generic retry with exponential back-off for non-Jupiter endpoints (Meteora etc.)
 async function fetchWithRetry(urlStr, opts = {}, maxRetries = 4) {
   let delay = 500;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -117,7 +136,7 @@ async function fetchWithRetry(urlStr, opts = {}, maxRetries = 4) {
       return await request(urlStr, opts);
     } catch (err) {
       if (err.status === 429) {
-        logErr(`Server responded with 429 Too Many Requests.  Retrying after ${delay}ms delay...`);
+        logErr(`[HTTP] 429 on ${urlStr} — retrying after ${delay}ms...`);
       } else if (attempt === maxRetries) {
         throw err;
       }
@@ -128,12 +147,48 @@ async function fetchWithRetry(urlStr, opts = {}, maxRetries = 4) {
 }
 
 // ─────────────────────────────────────────────────────────
-// DLMM pool fetching  (dlmm.datapi.meteora.ag/pools)
+// Jupiter-specific fetch with global rate-limit awareness
 //
-// Pagination: 1-based (minimum page=1), page_size up to 1000
-// Response:   { total, pages, current_page, page_size, data: PoolResponse[] }
-// Fields:     address, token_x (TokenMetrics obj), token_y (TokenMetrics obj),
-//             tvl (number), volume (TimeWindowData obj), fee_tvl_ratio (TimeWindowData obj)
+// When Jupiter returns 429:
+//   • Sets jupGlobalBackoffUntil = now + backoff duration
+//   • All subsequent Jupiter calls wait out the backoff before sending
+// This prevents the cascade of per-pool 429 retries visible in the logs.
+// ─────────────────────────────────────────────────────────
+
+async function jupFetch(urlStr, opts = {}) {
+  const maxRetries = 5;
+  let backoff = 2000; // first 429 wait 2s, then 4s, 8s …
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Honour global backoff from a previous call in this cycle
+    const now = Date.now();
+    if (jupGlobalBackoffUntil > now) {
+      const wait = jupGlobalBackoffUntil - now;
+      log(`  [JUP] Global rate-limit cooldown ${Math.ceil(wait / 1000)}s…`);
+      await sleep(wait);
+    }
+
+    try {
+      return await request(urlStr, opts);
+    } catch (err) {
+      if (err.status === 429) {
+        jupGlobalBackoffUntil = Date.now() + backoff;
+        log(`  [JUP] 429 — global backoff ${backoff}ms (attempt ${attempt}/${maxRetries})`);
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 30000);
+      } else if (attempt === maxRetries) {
+        throw err;
+      } else {
+        // Non-429 error: short retry
+        await sleep(500);
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// DLMM pool fetching  (dlmm.datapi.meteora.ag/pools)
+// Pagination 1-based. Sorted volume_24h:desc by API.
 // ─────────────────────────────────────────────────────────
 
 function mintOf(tok) {
@@ -144,7 +199,7 @@ function mintOf(tok) {
 
 async function fetchDlmmPools() {
   const pools = [];
-  let   page  = 1;          // 1-based per OpenAPI spec (minimum: 1)
+  let   page  = 1;
   const limit = 100;
 
   const params = new URLSearchParams({
@@ -153,12 +208,11 @@ async function fetchDlmmPools() {
     filter_by: 'is_blacklisted=false',
   });
 
-  while (pools.length < MAX_POOLS_PER_CYCLE) {
+  while (pools.length < MAX_FETCH_POOLS) {
     params.set('page', String(page));
-    const url = `${METEORA_DLMM_BASE}/pools?${params}`;
     let data;
     try {
-      data = await fetchWithRetry(url);
+      data = await fetchWithRetry(`${METEORA_DLMM_BASE}/pools?${params}`);
     } catch (e) {
       logErr(`[DLMM] page ${page} failed: ${e.message}`);
       break;
@@ -175,40 +229,21 @@ async function fetchDlmmPools() {
 
 // ─────────────────────────────────────────────────────────
 // DAMM pool fetching  (damm-api.meteora.ag/pools/search)
-//
-// The /pools/search endpoint is the correct paginated endpoint.
-// Pagination: 0-based (page=0 is first page), both page + size REQUIRED.
-// Response:   { data: PoolResponse[], page, total_count }
-//
-// /pools (bare) returns all pools as plain array but fails with any query params
-// — so we try /pools/search first, then fall back to bare /pools.
-//
-// PoolResponse fields: pool_address, pool_token_mints[], pool_tvl (string),
-//                      trading_volume, fee_volume, pool_name, ...
+// Pagination 0-based. page + size both required.
+// Fallback to bare /pools (no params) if search fails.
 // ─────────────────────────────────────────────────────────
-
-async function fetchDammPage(page, size) {
-  const params = new URLSearchParams({
-    page: String(page),
-    size: String(size),
-  });
-  return fetchWithRetry(`${METEORA_DAMM_BASE}/pools/search?${params}`);
-}
 
 async function fetchDammPools() {
   const pools = [];
-  let   page  = 0;    // 0-based
+  let   page  = 0;
   const size  = 100;
 
-  // Primary: paginated /pools/search
+  // Primary: /pools/search
   try {
-    while (pools.length < MAX_POOLS_PER_CYCLE) {
-      const data = await fetchDammPage(page, size);
-
-      // data may be { data: [], page, total_count } or plain array
-      const rows = Array.isArray(data) ? data
-                  : Array.isArray(data.data) ? data.data
-                  : [];
+    while (pools.length < MAX_FETCH_POOLS) {
+      const params = new URLSearchParams({ page: String(page), size: String(size) });
+      const data   = await fetchWithRetry(`${METEORA_DAMM_BASE}/pools/search?${params}`);
+      const rows   = Array.isArray(data) ? data : (data.data || []);
 
       if (!rows.length) break;
       pools.push(...rows);
@@ -217,20 +252,19 @@ async function fetchDammPools() {
       if (rows.length < size || pools.length >= total) break;
       page++;
     }
-
     if (pools.length > 0) return pools;
   } catch (e) {
     logErr(`[DAMM] /pools/search failed: ${e.message}`);
   }
 
-  // Fallback: bare /pools (no query params — returns full array)
+  // Fallback: bare /pools (no query params)
   try {
     const data = await fetchWithRetry(`${METEORA_DAMM_BASE}/pools`);
     const rows = Array.isArray(data) ? data : (data.data || data.pools || []);
-    logErr(`[DAMM] /pools fallback returned ${rows.length} pools`);
+    log(`[DAMM] /pools fallback: ${rows.length} pools`);
     return rows;
   } catch (e) {
-    logErr(`[DAMM] /pools fallback also failed: ${e.message}`);
+    logErr(`[DAMM] /pools fallback failed: ${e.message}`);
     return [];
   }
 }
@@ -256,10 +290,7 @@ function filterDlmmPools(pools) {
     const tvl    = parseFloat(p.tvl || 0);
     const vol    = parseFloat(p.volume?.['24h']        || p.volume?.h24       || 0);
     const feeTvl = parseFloat(p.fee_tvl_ratio?.['24h'] || p.fee_tvl_ratio?.h24 || 0);
-    if (tvl    < MIN_POOL_TVL)      return false;
-    if (vol    < MIN_POOL_VOL)      return false;
-    if (feeTvl < DLMM_MIN_FEE_TVL) return false;
-    return true;
+    return tvl >= MIN_POOL_TVL && vol >= MIN_POOL_VOL && feeTvl >= DLMM_MIN_FEE_TVL;
   });
 }
 
@@ -269,14 +300,12 @@ function filterDammPools(pools) {
     if (isBlacklisted(addr)) return false;
     const tvl = parseFloat(p.pool_tvl || p.tvl || 0);
     const vol = parseFloat(p.trading_volume || p.fee_volume || 0);
-    if (tvl < MIN_POOL_TVL) return false;
-    if (vol < MIN_POOL_VOL) return false;
-    return true;
+    return tvl >= MIN_POOL_TVL && vol >= MIN_POOL_VOL;
   });
 }
 
 // ─────────────────────────────────────────────────────────
-// Jupiter helpers  (lite-api.jup.ag/swap/v1)
+// Jupiter helpers
 // ─────────────────────────────────────────────────────────
 
 async function jupiterQuote(inputMint, outputMint, amountLamports) {
@@ -288,11 +317,11 @@ async function jupiterQuote(inputMint, outputMint, amountLamports) {
     onlyDirectRoutes:           'false',
     restrictIntermediateTokens: 'true',
   });
-  return fetchWithRetry(`${JUP_QUOTE_BASE}/quote?${params}`);
+  return jupFetch(`${JUP_QUOTE_BASE}/quote?${params}`);
 }
 
 async function jupiterSwap(quoteResponse, userPublicKey) {
-  return fetchWithRetry(`${JUP_BASE}/swap`, {
+  return jupFetch(`${JUP_BASE}/swap`, {
     method: 'POST',
     body: {
       quoteResponse,
@@ -316,7 +345,6 @@ async function executeSwap(pool, poolType, solAmountLamports) {
     mintX = mintOf(pool.token_x);
     mintY = mintOf(pool.token_y);
   } else {
-    // DAMM / CPMM — pool_token_mints is always a string[]
     addr  = pool.pool_address || pool.address || 'unknown';
     const mints = pool.pool_token_mints || [];
     mintX = mints[0] || null;
@@ -339,21 +367,20 @@ async function executeSwap(pool, poolType, solAmountLamports) {
 
   const buyAmountLamports = Math.floor(solAmountLamports * (buyPct / 100));
 
+  // Inter-call delay — throttle Jupiter quote rate
+  if (JUP_CALL_DELAY_MS > 0) await sleep(JUP_CALL_DELAY_MS);
+
   let quote;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      quote = await jupiterQuote(inputMint, outputMint, buyAmountLamports);
-      break;
-    } catch (err) {
-      const delay = attempt * 700;
-      log(`  Jupiter V1 attempt ${attempt} failed: ${err.message} — retry ${delay}ms`);
-      if (attempt === 3) {
-        log(` Jupiter V1 swap failed: ${err.message}`);
-        blacklistPool(addr, `${poolType}_swap failed`);
-        return false;
-      }
-      await sleep(delay);
+  try {
+    quote = await jupiterQuote(inputMint, outputMint, buyAmountLamports);
+  } catch (err) {
+    log(` Jupiter quote failed for ${shortAddr}: ${err.message}`);
+    if (err.message.includes('429')) {
+      // Do not blacklist on rate-limit — try again next cycle
+      return false;
     }
+    blacklistPool(addr, `${poolType}_quote_failed`);
+    return false;
   }
 
   if (!WALLET_PUBKEY) {
@@ -368,14 +395,16 @@ async function executeSwap(pool, poolType, solAmountLamports) {
     // To broadcast: Connection.sendRawTransaction(Buffer.from(tx, 'base64'))
     return true;
   } catch (err) {
-    log(` Swap execute failed: ${err.message}`);
-    blacklistPool(addr, `${poolType}_swap failed`);
+    log(` Swap failed for ${shortAddr}: ${err.message}`);
+    if (!err.message.includes('429')) {
+      blacklistPool(addr, `${poolType}_swap_failed`);
+    }
     return false;
   }
 }
 
 // ─────────────────────────────────────────────────────────
-// Hub — optional WebSocket connection (lazy ws import)
+// Hub — optional WebSocket (lazy ws import)
 // ─────────────────────────────────────────────────────────
 
 const hubEmitter = new EventEmitter();
@@ -400,7 +429,7 @@ async function runHarvestCycle() {
   const solLamports  = Math.floor(HARVEST_SOL_AMOUNT * 1e9);
   const slotsPerPool = 4;
 
-  // Fetch both sources in parallel
+  // Fetch both sources in parallel — pool discovery is fast, Jupiter quotes are slow
   const [rawDlmm, rawDamm] = await Promise.all([
     fetchDlmmPools(),
     fetchDammPools(),
@@ -411,19 +440,20 @@ async function runHarvestCycle() {
 
   log(`    DLMM raw:${rawDlmm.length} CLMM raw:0 CPMM raw:${rawDamm.length}`);
   log(`   DLMM: ${dlmmPools.length} pools x ${slotsPerPool} slots | CLMM: 0 | CPMM: ${cpmmPools.length} | USDC: 0 | ${HARVEST_SOL_AMOUNT.toFixed(4)} SOL/slot`);
+  log(`   Quoting top ${MAX_QUOTE_POOLS} DLMM pools (${JUP_CALL_DELAY_MS}ms inter-call delay)`);
 
   let entered = 0;
 
-  // Priority 1: DLMM (concentrated liquidity, highest fee yield)
-  for (const pool of dlmmPools.slice(0, MAX_POOLS_PER_CYCLE)) {
+  // Quote only the top MAX_QUOTE_POOLS (already sorted best-first by DLMM API)
+  for (const pool of dlmmPools.slice(0, MAX_QUOTE_POOLS)) {
     const ok = await executeSwap(pool, 'dlmm', solLamports);
     if (ok) entered++;
   }
 
-  // Priority 2: DAMM / CPMM — last resort when no DLMM pools entered
+  // CPMM fallback only if zero DLMM pools entered
   if (entered === 0 && cpmmPools.length > 0) {
     log(`  CPMM last resort: ${cpmmPools.length} verified slot(s)`);
-    for (const pool of cpmmPools.slice(0, 3)) {
+    for (const pool of cpmmPools.slice(0, Math.min(3, MAX_QUOTE_POOLS))) {
       const ok = await executeSwap(pool, 'cpmm', solLamports);
       if (ok) entered++;
     }
@@ -454,7 +484,9 @@ log(`DLMM_MIN_FEE_TVL:  ${DLMM_MIN_FEE_TVL}`);
 log(`MIN_POOL_TVL:      ${MIN_POOL_TVL}`);
 log(`MIN_POOL_VOL:      ${MIN_POOL_VOL}`);
 log(`HARVEST_INTERVAL:  ${HARVEST_INTERVAL_MS}ms`);
-log(`MAX_POOLS/CYCLE:   ${MAX_POOLS_PER_CYCLE}`);
+log(`MAX_FETCH_POOLS:   ${MAX_FETCH_POOLS}`);
+log(`MAX_QUOTE_POOLS:   ${MAX_QUOTE_POOLS}`);
+log(`JUP_CALL_DELAY:    ${JUP_CALL_DELAY_MS}ms`);
 log(`HARVEST_SOL:       ${HARVEST_SOL_AMOUNT} SOL/slot`);
 log(`WALLET:            ${WALLET_PUBKEY ? WALLET_PUBKEY.slice(0, 8) + '...' : '(not set — dry-run mode)'}`);
 
