@@ -333,6 +333,8 @@ def log_trade(sig: dict[str, Any], gale_num: int, stake: float, placed: bool) ->
     gale_label = "Entry" if gale_num == 0 else f"Gale {gale_num}"
     trade_log[key] = {
         "base_key": _base_key(sig),
+        "asset_key": sig["asset_key"],
+        "entry_time": sig["entry_time"],
         "display": sig["display"],
         "direction": sig["direction"],
         "stake": stake,
@@ -345,6 +347,114 @@ def log_trade(sig: dict[str, Any], gale_num: int, stake: float, placed: bool) ->
     if len(trade_log) > 200:
         oldest = min(trade_log, key=lambda k: trade_log[k]["time"])
         del trade_log[oldest]
+
+
+def _normalized_symbol(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", symbol.upper())
+
+
+def _build_symbol_candidates(asset: str) -> list[str]:
+    """
+    Build a robust list of IQ Option symbol candidates.
+    Supports inputs like EUR/GBP (asset key), EURGBP, EURGBP-OTC.
+    """
+    candidates: list[str] = []
+
+    def add(sym: str | None) -> None:
+        if not sym:
+            return
+        if sym not in candidates:
+            candidates.append(sym)
+
+    if asset in ASSET_MAP:
+        # asset key style: EUR/GBP
+        add(ASSET_MAP.get(asset))
+        add(LIVE_ASSET_MAP.get(asset))
+        compact = asset.replace("/", "")
+        add(compact)
+        add(f"{compact}-OTC")
+    else:
+        # already symbol style
+        add(asset)
+        compact = asset.replace("/", "")
+        add(compact)
+
+    for base in list(candidates):
+        if base.endswith("-OTC"):
+            add(base.replace("-OTC", ""))
+        else:
+            add(f"{base}-OTC")
+
+    return candidates
+
+
+def _resolve_open_symbol_variants() -> dict[str, str]:
+    """
+    Map normalized symbols to open symbols returned by IQ Option.
+    """
+    if iq_api is None:
+        return {}
+    normalized_to_open: dict[str, str] = {}
+    try:
+        open_times = iq_api.get_all_open_time() or {}
+        for market in ("turbo", "binary", "digital"):
+            market_data = open_times.get(market, {})
+            if not isinstance(market_data, dict):
+                continue
+            for symbol, data in market_data.items():
+                if isinstance(data, dict) and data.get("open"):
+                    normalized_to_open[_normalized_symbol(symbol)] = symbol
+    except Exception as exc:
+        log.warning(f"Could not fetch open symbols: {exc}")
+    return normalized_to_open
+
+
+def _match_trade_for_result(result: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """
+    Match a result message to our most likely pending trade.
+    - Prefer exact (time + asset + gale).
+    - Fallback to same time + asset any gale.
+    - Fallback to latest pending by asset (+ gale when available).
+    """
+    result_time = result.get("time")
+    result_asset = result.get("asset_key")
+    result_gale = int(result.get("gale_num", 0))
+
+    if result_time and result_asset:
+        exact_key = _trade_key(result_time, result_asset, result_gale)
+        trade = trade_log.get(exact_key)
+        if trade and trade.get("result") is None:
+            return exact_key, trade
+
+        for g in range(MAX_GALES + 1):
+            key = _trade_key(result_time, result_asset, g)
+            t = trade_log.get(key)
+            if t and t.get("result") is None:
+                return key, t
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for key, trade in trade_log.items():
+        if trade.get("result") is not None:
+            continue
+        if trade.get("asset_key") != result_asset:
+            continue
+        if result_gale > 0 and int(trade.get("gale_num", 0)) != result_gale:
+            continue
+        candidates.append((key, trade))
+
+    if not candidates and result_asset:
+        # Last fallback: ignore gale, still keep asset constraint.
+        for key, trade in trade_log.items():
+            if trade.get("result") is not None:
+                continue
+            if trade.get("asset_key") == result_asset:
+                candidates.append((key, trade))
+
+    if not candidates:
+        return None, None
+
+    best_key, best_trade = max(candidates, key=lambda pair: float(pair[1].get("time", 0.0)))
+    return best_key, best_trade
 
 
 # -----------------------------------------------------------------------------
@@ -383,37 +493,52 @@ def iq_place_trade(asset: str, direction: str, amount: float, expiry_min: int) -
     try:
         if iq_api is None and not iq_connect():
             return False
-
-        iq_asset = (
-            ASSET_MAP.get(asset, asset)
-            if is_demo
-            else LIVE_ASSET_MAP.get(asset, ASSET_MAP.get(asset, asset))
-        )
         action = "call" if direction == "call" else "put"
 
-        log.info(f"Placing: {iq_asset} {action} ${amount} {expiry_min}min [{mode()}]")
-        check, order_id = iq_api.buy(amount, iq_asset, action, expiry_min)
-        if check:
-            log.info(f"TRADE PLACED! Order: {order_id}")
-            time.sleep(1)
-            bal = iq_api.get_balance()
-            if bal is not None:
-                account_balance = float(bal)
-            return True
+        # Optional reconnect guard when session drops silently.
+        try:
+            if hasattr(iq_api, "check_connect") and not iq_api.check_connect():
+                log.warning("IQ session disconnected, reconnecting before trade...")
+                if not iq_connect():
+                    return False
+        except Exception:
+            pass
 
-        # fallback non-OTC symbol
-        iq_asset2 = iq_asset.replace("-OTC", "")
-        if iq_asset2 != iq_asset:
-            log.info(f"Retrying non-OTC: {iq_asset2}")
-            check2, order_id2 = iq_api.buy(amount, iq_asset2, action, expiry_min)
-            if check2:
-                log.info(f"TRADE PLACED (non-OTC)! Order: {order_id2}")
+        candidates = _build_symbol_candidates(asset)
+        open_symbol_variants = _resolve_open_symbol_variants()
+        prioritized: list[str] = []
+
+        # First try candidates that map to currently open symbols.
+        for symbol in candidates:
+            normalized = _normalized_symbol(symbol)
+            open_symbol = open_symbol_variants.get(normalized)
+            if open_symbol and open_symbol not in prioritized:
+                prioritized.append(open_symbol)
+
+        # Then try raw candidates as fallback.
+        for symbol in candidates:
+            if symbol not in prioritized:
+                prioritized.append(symbol)
+
+        last_reason = None
+        for iq_asset in prioritized:
+            log.info(f"Placing: {iq_asset} {action} ${amount} {expiry_min}min [{mode()}]")
+            check, order_id = iq_api.buy(amount, iq_asset, action, expiry_min)
+            if check:
+                log.info(f"TRADE PLACED! Symbol: {iq_asset} | Order: {order_id}")
+                time.sleep(1)
                 bal = iq_api.get_balance()
                 if bal is not None:
                     account_balance = float(bal)
                 return True
 
-        log.error(f"Trade failed: {order_id}")
+            last_reason = order_id
+            log.warning(f"Trade attempt failed for {iq_asset}: {order_id}")
+
+        log.error(
+            f"Trade failed for asset {asset} after {len(prioritized)} symbol attempts. "
+            f"Last reason: {last_reason}"
+        )
         return False
     except Exception as exc:
         log.error(f"Trade error: {exc}")
@@ -677,7 +802,7 @@ async def execute_with_countdown(sig: dict[str, Any], gale_num: int = 0) -> None
     success = await loop.run_in_executor(
         None,
         iq_place_trade,
-        sig["asset"],
+        sig["asset_key"],
         sig["direction"],
         stake,
         sig["expiry_min"],
@@ -922,21 +1047,7 @@ async def on_magic_trader(event: events.NewMessage.Event) -> None:
     result = parse_result(text)
     if result:
         gale_num = result.get("gale_num", 0)
-        key = (
-            _trade_key(result["time"], result["asset_key"], gale_num)
-            if result.get("time")
-            else None
-        )
-        trade = trade_log.get(key) if key else None
-
-        # Fallback: match any pending trade at same time/asset
-        if not trade and result.get("time"):
-            for g in range(MAX_GALES + 1):
-                k2 = _trade_key(result["time"], result["asset_key"], g)
-                if k2 in trade_log and trade_log[k2]["result"] is None:
-                    trade = trade_log[k2]
-                    key = k2
-                    break
+        key, trade = _match_trade_for_result(result)
 
         emoji = "✅" if result["result"] == "GAIN" else "❌"
         label = "ENTRY" if gale_num == 0 else f"GALE {gale_num}"
@@ -955,10 +1066,11 @@ async def on_magic_trader(event: events.NewMessage.Event) -> None:
                 f"Result: {result['result']}"
             )
             trade["result"] = result["result"]
-            if result.get("time"):
+            trade_entry_time = result.get("time") or trade.get("entry_time")
+            if trade_entry_time:
                 update_trade_result(
                     asset_key=result["asset_key"],
-                    entry_time=result["time"],
+                    entry_time=str(trade_entry_time),
                     gale_num=int(trade["gale_num"]),
                     result=result["result"],
                     stake=float(trade["stake"]),
