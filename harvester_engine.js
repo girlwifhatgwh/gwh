@@ -4,13 +4,19 @@
  * Pool sources (confirmed from live OpenAPI specs):
  *   DLMM  → https://dlmm.datapi.meteora.ag/pools
  *             pages 1-based, page_size up to 1000, response: { total, pages, current_page, page_size, data[] }
- *             Already sorted volume_24h:desc — top pools are best-yield first.
+ *             Sorted volume_24h:desc by API — top pools are best-yield first.
  *   DAMM  → https://damm-api.meteora.ag/pools/search
  *             pages 0-based, required: page + size, response: { data[], page, total_count }
  *
  * Jupiter → https://lite-api.jup.ag/swap/v1/quote  +  /swap
- *   Rate limit: lite endpoint is free-tier, ~10 req/s sustained.
- *   We cap MAX_QUOTE_POOLS and add JUP_CALL_DELAY_MS between calls to stay within limits.
+ *
+ * Rate-limit strategy:
+ *   - JUP_CALL_DELAY_MS (default 2000ms) between consecutive calls → ~0.5 req/s
+ *   - MAX_QUOTE_POOLS (default 5) — only quote the top N pools per cycle
+ *   - On ANY 429: abort cycle immediately, skip all remaining pools.
+ *     Do NOT retry within the cycle. Let the full HARVEST_INTERVAL pass before
+ *     the next attempt. This allows the IP-level throttle to cool down.
+ *   - Read Retry-After header (if present) and honour it across cycles.
  */
 
 import https from 'node:https';
@@ -36,18 +42,15 @@ const JUP_API_KEY      = process.env.JUP_API_KEY      || '';
 const HUB_URL          = process.env.HUB_URL          || '';
 
 const HARVEST_INTERVAL_MS = parseInt(process.env.HARVEST_INTERVAL_MS || '60000', 10);
+const MAX_FETCH_POOLS     = parseInt(process.env.MAX_FETCH_POOLS     || '100',   10);
 
-// MAX_FETCH_POOLS: how many pools to pull from each API per cycle (for pool selection)
-const MAX_FETCH_POOLS = parseInt(process.env.MAX_FETCH_POOLS || '100', 10);
+// Quote only the top N pools per cycle (pre-sorted best-first by DLMM API).
+// Keep low to stay within the free-tier rate limit.
+const MAX_QUOTE_POOLS = parseInt(process.env.MAX_QUOTE_POOLS || '5', 10);
 
-// MAX_QUOTE_POOLS: how many pools to actually call Jupiter quote for per cycle.
-// DLMM is already sorted volume_24h:desc so these are the highest-yield pools.
-// Keep this LOW to respect the free-tier rate limit (~10 req/s).
-const MAX_QUOTE_POOLS = parseInt(process.env.MAX_QUOTE_POOLS || '10', 10);
-
-// Delay between Jupiter quote calls in milliseconds.
-// At 300ms we stay well under 10 req/s even with retries.
-const JUP_CALL_DELAY_MS = parseInt(process.env.JUP_CALL_DELAY_MS || '300', 10);
+// Mandatory pause between consecutive Jupiter calls (ms).
+// 2000ms = 0.5 req/s — conservative for the unauthenticated lite endpoint.
+const JUP_CALL_DELAY_MS = parseInt(process.env.JUP_CALL_DELAY_MS || '2000', 10);
 
 const SLIPPAGE_BPS       = parseInt(process.env.SLIPPAGE_BPS       || '100',  10);
 const HARVEST_SOL_AMOUNT = parseFloat(process.env.HARVEST_SOL_AMOUNT || '0.05');
@@ -55,11 +58,19 @@ const HARVEST_SOL_AMOUNT = parseFloat(process.env.HARVEST_SOL_AMOUNT || '0.05');
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-// Runtime blacklist — clears on restart
 const blacklist = new Map();
 
-// Global Jupiter rate-limit state: if we hit a 429, back off across all subsequent calls.
-let jupGlobalBackoffUntil = 0;
+// When set, all Jupiter calls are skipped until this timestamp passes.
+// Persists across cycles within the same process lifetime.
+let jupThrottledUntil = 0;
+
+// Thrown internally to signal "abort this cycle, do not blacklist any pool".
+class RateLimitAbort extends Error {
+  constructor(retryAfterMs) {
+    super('Jupiter rate-limited — aborting cycle');
+    this.retryAfterMs = retryAfterMs;
+  }
+}
 
 // ─────────────────────────────────────────────────────────
 // Logging
@@ -103,9 +114,12 @@ function request(urlStr, opts = {}) {
       res.on('data', (c) => { raw += c; });
       res.on('end', () => {
         if (res.statusCode === 429) {
+          // Parse Retry-After header if present (value is seconds)
+          const retryAfter = res.headers['retry-after'];
+          const retryMs    = retryAfter ? parseInt(retryAfter, 10) * 1000 : 0;
           return reject(Object.assign(
             new Error('429 Too Many Requests'),
-            { status: 429 }
+            { status: 429, retryAfterMs: retryMs }
           ));
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -115,7 +129,7 @@ function request(urlStr, opts = {}) {
           ));
         }
         try   { resolve(JSON.parse(raw)); }
-        catch (e) { reject(new Error(`JSON parse error: ${e.message} | body=${raw.slice(0, 200)}`)); }
+        catch (e) { reject(new Error(`JSON parse: ${e.message} | body=${raw.slice(0, 200)}`)); }
       });
     });
 
@@ -128,7 +142,7 @@ function request(urlStr, opts = {}) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// Generic retry with exponential back-off for non-Jupiter endpoints (Meteora etc.)
+// Non-Jupiter fetch with standard exponential back-off (Meteora APIs are generous).
 async function fetchWithRetry(urlStr, opts = {}, maxRetries = 4) {
   let delay = 500;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -147,48 +161,39 @@ async function fetchWithRetry(urlStr, opts = {}, maxRetries = 4) {
 }
 
 // ─────────────────────────────────────────────────────────
-// Jupiter-specific fetch with global rate-limit awareness
+// Jupiter fetch — abort-on-429 strategy
 //
-// When Jupiter returns 429:
-//   • Sets jupGlobalBackoffUntil = now + backoff duration
-//   • All subsequent Jupiter calls wait out the backoff before sending
-// This prevents the cascade of per-pool 429 retries visible in the logs.
+// Philosophy: one 429 means the IP is already throttled.
+// Retrying within the same cycle just keeps the throttle alive.
+// Instead: record how long to cool down, throw RateLimitAbort to
+// unwind the entire cycle, and let the next scheduled cycle try fresh.
 // ─────────────────────────────────────────────────────────
 
 async function jupFetch(urlStr, opts = {}) {
-  const maxRetries = 5;
-  let backoff = 2000; // first 429 wait 2s, then 4s, 8s …
+  // Honour cool-down from a previous 429 in this process lifetime
+  const now = Date.now();
+  if (jupThrottledUntil > now) {
+    const remaining = jupThrottledUntil - now;
+    log(`  [JUP] Still rate-limited — skipping (${Math.ceil(remaining / 1000)}s remaining)`);
+    throw new RateLimitAbort(remaining);
+  }
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // Honour global backoff from a previous call in this cycle
-    const now = Date.now();
-    if (jupGlobalBackoffUntil > now) {
-      const wait = jupGlobalBackoffUntil - now;
-      log(`  [JUP] Global rate-limit cooldown ${Math.ceil(wait / 1000)}s…`);
-      await sleep(wait);
+  try {
+    return await request(urlStr, opts);
+  } catch (err) {
+    if (err.status === 429) {
+      // Use server's Retry-After if available; otherwise cool down for one full cycle interval.
+      const cooldown = err.retryAfterMs > 0 ? err.retryAfterMs : HARVEST_INTERVAL_MS;
+      jupThrottledUntil = Date.now() + cooldown;
+      log(`  [JUP] 429 received — aborting cycle. Cooling down ${Math.ceil(cooldown / 1000)}s (until next cycle).`);
+      throw new RateLimitAbort(cooldown);
     }
-
-    try {
-      return await request(urlStr, opts);
-    } catch (err) {
-      if (err.status === 429) {
-        jupGlobalBackoffUntil = Date.now() + backoff;
-        log(`  [JUP] 429 — global backoff ${backoff}ms (attempt ${attempt}/${maxRetries})`);
-        await sleep(backoff);
-        backoff = Math.min(backoff * 2, 30000);
-      } else if (attempt === maxRetries) {
-        throw err;
-      } else {
-        // Non-429 error: short retry
-        await sleep(500);
-      }
-    }
+    throw err;
   }
 }
 
 // ─────────────────────────────────────────────────────────
 // DLMM pool fetching  (dlmm.datapi.meteora.ag/pools)
-// Pagination 1-based. Sorted volume_24h:desc by API.
 // ─────────────────────────────────────────────────────────
 
 function mintOf(tok) {
@@ -217,7 +222,6 @@ async function fetchDlmmPools() {
       logErr(`[DLMM] page ${page} failed: ${e.message}`);
       break;
     }
-
     const rows = data.data || [];
     if (!rows.length) break;
     pools.push(...rows);
@@ -229,8 +233,6 @@ async function fetchDlmmPools() {
 
 // ─────────────────────────────────────────────────────────
 // DAMM pool fetching  (damm-api.meteora.ag/pools/search)
-// Pagination 0-based. page + size both required.
-// Fallback to bare /pools (no params) if search fails.
 // ─────────────────────────────────────────────────────────
 
 async function fetchDammPools() {
@@ -238,16 +240,13 @@ async function fetchDammPools() {
   let   page  = 0;
   const size  = 100;
 
-  // Primary: /pools/search
   try {
     while (pools.length < MAX_FETCH_POOLS) {
       const params = new URLSearchParams({ page: String(page), size: String(size) });
       const data   = await fetchWithRetry(`${METEORA_DAMM_BASE}/pools/search?${params}`);
       const rows   = Array.isArray(data) ? data : (data.data || []);
-
       if (!rows.length) break;
       pools.push(...rows);
-
       const total = data.total_count || 0;
       if (rows.length < size || pools.length >= total) break;
       page++;
@@ -257,7 +256,6 @@ async function fetchDammPools() {
     logErr(`[DAMM] /pools/search failed: ${e.message}`);
   }
 
-  // Fallback: bare /pools (no query params)
   try {
     const data = await fetchWithRetry(`${METEORA_DAMM_BASE}/pools`);
     const rows = Array.isArray(data) ? data : (data.data || data.pools || []);
@@ -335,6 +333,7 @@ async function jupiterSwap(quoteResponse, userPublicKey) {
 
 // ─────────────────────────────────────────────────────────
 // Swap execution — shared for DLMM and DAMM pools
+// Throws RateLimitAbort upward to abort the whole cycle.
 // ─────────────────────────────────────────────────────────
 
 async function executeSwap(pool, poolType, solAmountLamports) {
@@ -367,18 +366,15 @@ async function executeSwap(pool, poolType, solAmountLamports) {
 
   const buyAmountLamports = Math.floor(solAmountLamports * (buyPct / 100));
 
-  // Inter-call delay — throttle Jupiter quote rate
+  // Throttle: mandatory delay before each Jupiter call
   if (JUP_CALL_DELAY_MS > 0) await sleep(JUP_CALL_DELAY_MS);
 
   let quote;
   try {
     quote = await jupiterQuote(inputMint, outputMint, buyAmountLamports);
   } catch (err) {
+    if (err instanceof RateLimitAbort) throw err; // propagate up — abort cycle
     log(` Jupiter quote failed for ${shortAddr}: ${err.message}`);
-    if (err.message.includes('429')) {
-      // Do not blacklist on rate-limit — try again next cycle
-      return false;
-    }
     blacklistPool(addr, `${poolType}_quote_failed`);
     return false;
   }
@@ -395,16 +391,15 @@ async function executeSwap(pool, poolType, solAmountLamports) {
     // To broadcast: Connection.sendRawTransaction(Buffer.from(tx, 'base64'))
     return true;
   } catch (err) {
+    if (err instanceof RateLimitAbort) throw err;
     log(` Swap failed for ${shortAddr}: ${err.message}`);
-    if (!err.message.includes('429')) {
-      blacklistPool(addr, `${poolType}_swap_failed`);
-    }
+    blacklistPool(addr, `${poolType}_swap_failed`);
     return false;
   }
 }
 
 // ─────────────────────────────────────────────────────────
-// Hub — optional WebSocket (lazy ws import)
+// Hub — optional WebSocket
 // ─────────────────────────────────────────────────────────
 
 const hubEmitter = new EventEmitter();
@@ -429,7 +424,15 @@ async function runHarvestCycle() {
   const solLamports  = Math.floor(HARVEST_SOL_AMOUNT * 1e9);
   const slotsPerPool = 4;
 
-  // Fetch both sources in parallel — pool discovery is fast, Jupiter quotes are slow
+  // Skip cycle entirely if still rate-limited from a previous cycle
+  const now = Date.now();
+  if (jupThrottledUntil > now) {
+    const remaining = jupThrottledUntil - now;
+    log(`  [JUP] IP still cooling down — skipping cycle (${Math.ceil(remaining / 1000)}s remaining)`);
+    return;
+  }
+
+  // Fetch both pool sources in parallel (these hit Meteora, not Jupiter)
   const [rawDlmm, rawDamm] = await Promise.all([
     fetchDlmmPools(),
     fetchDammPools(),
@@ -440,34 +443,44 @@ async function runHarvestCycle() {
 
   log(`    DLMM raw:${rawDlmm.length} CLMM raw:0 CPMM raw:${rawDamm.length}`);
   log(`   DLMM: ${dlmmPools.length} pools x ${slotsPerPool} slots | CLMM: 0 | CPMM: ${cpmmPools.length} | USDC: 0 | ${HARVEST_SOL_AMOUNT.toFixed(4)} SOL/slot`);
-  log(`   Quoting top ${MAX_QUOTE_POOLS} DLMM pools (${JUP_CALL_DELAY_MS}ms inter-call delay)`);
+  log(`   Quoting top ${Math.min(MAX_QUOTE_POOLS, dlmmPools.length)} DLMM pools (${JUP_CALL_DELAY_MS}ms inter-call delay)`);
 
   let entered = 0;
 
-  // Quote only the top MAX_QUOTE_POOLS (already sorted best-first by DLMM API)
-  for (const pool of dlmmPools.slice(0, MAX_QUOTE_POOLS)) {
-    const ok = await executeSwap(pool, 'dlmm', solLamports);
-    if (ok) entered++;
-  }
-
-  // CPMM fallback only if zero DLMM pools entered
-  if (entered === 0 && cpmmPools.length > 0) {
-    log(`  CPMM last resort: ${cpmmPools.length} verified slot(s)`);
-    for (const pool of cpmmPools.slice(0, Math.min(3, MAX_QUOTE_POOLS))) {
-      const ok = await executeSwap(pool, 'cpmm', solLamports);
+  try {
+    // Top N DLMM pools only (already sorted best-first)
+    for (const pool of dlmmPools.slice(0, MAX_QUOTE_POOLS)) {
+      const ok = await executeSwap(pool, 'dlmm', solLamports);
       if (ok) entered++;
     }
-  }
 
-  if (entered === 0 && cpmmPools.length > 0) {
-    log(`  No DLMM/CLMM pools entered — forcing CPMM fallback entry`);
-    log(`    Force fallback: ${cpmmPools.length} CPMM pools available`);
-    const pool = cpmmPools[0];
-    const addr = pool.pool_address || pool.address || '';
-    log(`   Force entering CPMM: ${addr.slice(0, 4)}../SOL`);
-    await executeSwap(pool, 'cpmm', solLamports);
-  } else if (entered === 0) {
-    log(`    No pools entered — reserves protected`);
+    // CPMM fallback only if no DLMM pools entered
+    if (entered === 0 && cpmmPools.length > 0) {
+      log(`  CPMM last resort: ${cpmmPools.length} verified slot(s)`);
+      for (const pool of cpmmPools.slice(0, Math.min(3, MAX_QUOTE_POOLS))) {
+        const ok = await executeSwap(pool, 'cpmm', solLamports);
+        if (ok) entered++;
+      }
+    }
+
+    if (entered === 0 && cpmmPools.length > 0) {
+      log(`  No DLMM/CLMM pools entered — forcing CPMM fallback entry`);
+      log(`    Force fallback: ${cpmmPools.length} CPMM pools available`);
+      const pool = cpmmPools[0];
+      const addr = pool.pool_address || pool.address || '';
+      log(`   Force entering CPMM: ${addr.slice(0, 4)}../SOL`);
+      await executeSwap(pool, 'cpmm', solLamports);
+    } else if (entered === 0) {
+      log(`    No pools entered — reserves protected`);
+    }
+  } catch (err) {
+    if (err instanceof RateLimitAbort) {
+      // Cycle aborted due to 429 — do nothing here, jupThrottledUntil is already set.
+      // The next scheduled cycle will check it and skip if still cooling down.
+      log(`  [JUP] Cycle aborted due to rate-limit. Next attempt after cooldown.`);
+      return;
+    }
+    throw err;
   }
 }
 
@@ -489,6 +502,12 @@ log(`MAX_QUOTE_POOLS:   ${MAX_QUOTE_POOLS}`);
 log(`JUP_CALL_DELAY:    ${JUP_CALL_DELAY_MS}ms`);
 log(`HARVEST_SOL:       ${HARVEST_SOL_AMOUNT} SOL/slot`);
 log(`WALLET:            ${WALLET_PUBKEY ? WALLET_PUBKEY.slice(0, 8) + '...' : '(not set — dry-run mode)'}`);
+if (JUP_API_KEY) {
+  log(`JUP_API_KEY:       set (authenticated mode)`);
+} else {
+  log(`JUP_API_KEY:       not set — using unauthenticated lite endpoint (rate-limited)`);
+  log(`                   Get a free key at https://portal.jup.ag to remove rate limits`);
+}
 
 connectHub();
 
