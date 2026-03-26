@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 =============================================================================
   MAGIC TRADER -> IQ OPTION BOT v1.0
@@ -602,11 +603,11 @@ def iq_keepalive() -> None:
 def parse_result(text: str) -> dict[str, Any] | None:
     """
     Parse Magic Trader result messages:
-    ✅ EUR/AUD;09:05;PUT->GAIN
-    ❌ USD/BRL;10:35;PUT->LOSS
-    ✅ EUR/AUD;09:05;PUT->DIRECT WIN
-    ✅ EUR/AUD;09:26|CALL->GAIN ✅  (1st GALE)
-    ❌ EUR/AUD;09:26|CALL->LOSS (2nd GALE)
+    EUR/AUD;09:05;PUT->GAIN
+    USD/BRL;10:35;PUT->LOSS
+    EUR/AUD;09:05;PUT->DIRECT WIN
+    EUR/AUD;09:26|CALL->GAIN (1st GALE)
+    EUR/AUD;09:26|CALL->LOSS (2nd GALE)
     """
     t = text.strip()
     upper = t.upper()
@@ -660,10 +661,11 @@ def parse_magic_trader(text: str) -> dict[str, Any] | None:
     if not asset_key:
         return None
 
+    upper = t.upper()
     direction = None
-    if "PUT" in t.upper():
+    if "PUT" in upper or "LOWER" in upper or "DOWN" in upper:
         direction = "put"
-    elif "CALL" in t.upper():
+    elif "CALL" in upper or "HIGHER" in upper or "UP" in upper:
         direction = "call"
     elif any(x in t for x in ["↑", "🟢"]):
         direction = "call"
