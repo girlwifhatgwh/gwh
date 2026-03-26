@@ -17,10 +17,11 @@
 import https from 'node:https';
 import http  from 'node:http';
 import { EventEmitter } from 'node:events';
-import { existsSync }   from 'node:fs';
-import { resolve }      from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { execSync }     from 'node:child_process';
+import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { resolve, join }   from 'node:path';
+import { pathToFileURL }   from 'node:url';
+import { execSync }        from 'node:child_process';
+import { tmpdir }          from 'node:os';
 import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -111,57 +112,64 @@ async function loadPrivateKeyRaw() {
   }
 
   // ── 2. Windows Credential Manager direct read via PowerShell ──
-  // Reads the credential stored by: cmdkey /add:HARVESTER_PRIVATE_KEY /user:GWH_BOT
-  // CredRead type 1 = CRED_TYPE_GENERIC, type 2 = CRED_TYPE_DOMAIN_PASSWORD
-  // cmdkey stores as Domain (type 2), so we try both.
+  // Write the PS1 script to a temp file (avoids all inline quoting/escaping issues).
+  // Reads credential stored by: cmdkey /add:HARVESTER_PRIVATE_KEY /user:GWH_BOT
+  // Tries all three Windows credential types: Generic(1), Domain(2), Certificate(3).
+  const ps1Path = join(tmpdir(), `gwh_wcm_${process.pid}.ps1`);
   try {
-    const psScript = `
-$ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public class WinCred {
-  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-  public struct CREDENTIAL {
-    public uint Flags; public uint Type; public string TargetName;
-    public string Comment; public long LastWritten;
-    public uint CredentialBlobSize; public IntPtr CredentialBlob;
-    public uint Persist; public uint AttributeCount; public IntPtr Attributes;
-    public string TargetAlias; public string UserName;
-  }
-  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-  public static extern bool CredReadW(string target, uint type, uint flags, out IntPtr cred);
-  [DllImport("advapi32.dll")]
-  public static extern void CredFree(IntPtr cred);
-  public static string Read(string target) {
-    IntPtr ptr = IntPtr.Zero;
-    foreach (uint t in new uint[]{1,2,3}) {
-      if (CredReadW(target, t, 0, out ptr)) {
-        var c = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));
-        byte[] b = new byte[c.CredentialBlobSize];
-        Marshal.Copy(c.CredentialBlob, b, 0, b.Length);
-        CredFree(ptr);
-        return Encoding.Unicode.GetString(b);
-      }
-    }
-    return "";
-  }
-}
-"@ -Language CSharp
-$result = [WinCred]::Read("HARVESTER_PRIVATE_KEY")
-Write-Output $result`.trim();
+    const psScript = [
+      '$ErrorActionPreference = "Stop"',
+      'Add-Type -TypeDefinition @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'using System.Text;',
+      'public class WinCred {',
+      '  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]',
+      '  public struct CREDENTIAL {',
+      '    public uint Flags; public uint Type; public string TargetName;',
+      '    public string Comment; public long LastWritten;',
+      '    public uint CredentialBlobSize; public IntPtr CredentialBlob;',
+      '    public uint Persist; public uint AttributeCount; public IntPtr Attributes;',
+      '    public string TargetAlias; public string UserName;',
+      '  }',
+      '  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]',
+      '  public static extern bool CredReadW(string target, uint type, uint flags, out IntPtr cred);',
+      '  [DllImport("advapi32.dll")]',
+      '  public static extern void CredFree(IntPtr cred);',
+      '  public static string Read(string target) {',
+      '    IntPtr ptr = IntPtr.Zero;',
+      '    foreach (uint t in new uint[]{1,2,3}) {',
+      '      if (CredReadW(target, t, 0, out ptr)) {',
+      '        var c = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));',
+      '        byte[] b = new byte[c.CredentialBlobSize];',
+      '        Marshal.Copy(c.CredentialBlob, b, 0, b.Length);',
+      '        CredFree(ptr);',
+      '        return Encoding.Unicode.GetString(b);',
+      '      }',
+      '    }',
+      '    return "";',
+      '  }',
+      '}',
+      '"@ -Language CSharp',
+      '[WinCred]::Read("HARVESTER_PRIVATE_KEY")',
+    ].join('\r\n');
+
+    writeFileSync(ps1Path, psScript, 'utf8');
 
     const raw = execSync(
-      `powershell -NoProfile -NonInteractive -Command "${psScript.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
-      { encoding: 'utf8', timeout: 10000, windowsHide: true }
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${ps1Path}"`,
+      { encoding: 'utf8', timeout: 15000, windowsHide: true }
     ).trim();
 
-    if (raw && raw.length > 30 && !raw.includes(' ') && !raw.includes('\n')) {
+    try { unlinkSync(ps1Path); } catch (_) {}
+
+    if (raw && raw.length > 30 && !raw.includes('\n') && !raw.startsWith('Add-Type')) {
       log('[WALLET] Key loaded from Windows Credential Manager (target=HARVESTER_PRIVATE_KEY)');
       return raw;
     }
+    if (raw) log(`[WALLET] WCM read returned unexpected value (len=${raw.length}), skipping`);
   } catch (e) {
+    try { unlinkSync(ps1Path); } catch (_) {}
     log(`[WALLET] Windows Credential Manager read failed: ${e.message.split('\n')[0]}`);
   }
 
