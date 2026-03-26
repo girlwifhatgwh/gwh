@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import atexit
 import json as _json
 import logging
 import os
@@ -82,6 +83,7 @@ GALE_MULTIPLIER = float(os.getenv("GALE_MULTIPLIER", "2.0"))
 COUNTDOWN_SECS = int(os.getenv("COUNTDOWN_SECS", "30"))
 
 TRADES_FILE = Path(os.getenv("TRADES_FILE", "trades_db.json"))
+INSTANCE_LOCK_FILE = Path(os.getenv("INSTANCE_LOCK_FILE", "magic_iq_bot.instance.lock"))
 
 try:
     from zoneinfo import ZoneInfo
@@ -116,6 +118,7 @@ _cancelled: set[str] = set()
 # Trade result tracking:
 # key = f"{entry_time}_{asset_key}_g{gale_num}"
 trade_log: dict[str, dict[str, Any]] = {}
+_instance_lock_acquired = False
 
 
 # -----------------------------------------------------------------------------
@@ -479,6 +482,82 @@ def _match_trade_for_result(result: dict[str, Any]) -> tuple[str | None, dict[st
 
     best_key, best_trade = max(candidates, key=lambda pair: float(pair[1].get("time", 0.0)))
     return best_key, best_trade
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_instance_lock() -> bool:
+    """
+    Prevent duplicate bot workers on the same machine.
+    Returns True when this process owns the lock.
+    """
+    global _instance_lock_acquired
+    try:
+        # Use atomic file creation to avoid race conditions when PM2 starts
+        # multiple workers at once.
+        for _ in range(2):
+            try:
+                fd = os.open(
+                    str(INSTANCE_LOCK_FILE),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o644,
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(str(os.getpid()))
+                _instance_lock_acquired = True
+                return True
+            except FileExistsError:
+                existing_pid = 0
+                try:
+                    existing_pid = int(
+                        INSTANCE_LOCK_FILE.read_text(encoding="utf-8").strip() or "0"
+                    )
+                except Exception:
+                    existing_pid = 0
+
+                if existing_pid and _pid_is_running(existing_pid):
+                    log.error(
+                        "Another MAGIC-IQ instance is already running "
+                        f"(pid={existing_pid}). Duplicate worker will stay passive."
+                    )
+                    return False
+
+                # Stale lock: remove and retry once.
+                try:
+                    INSTANCE_LOCK_FILE.unlink()
+                except Exception:
+                    pass
+        log.error("Could not acquire instance lock; duplicate worker will stay passive.")
+        return False
+    except Exception as exc:
+        # If lock handling fails, do not crash bot startup.
+        log.warning(f"Instance lock setup failed, continuing without lock: {exc}")
+        return True
+
+
+def release_instance_lock() -> None:
+    global _instance_lock_acquired
+    if not _instance_lock_acquired:
+        return
+    try:
+        if INSTANCE_LOCK_FILE.exists():
+            lock_pid = int(INSTANCE_LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
+            if lock_pid == os.getpid():
+                INSTANCE_LOCK_FILE.unlink()
+    except Exception:
+        pass
+    _instance_lock_acquired = False
+
+
+atexit.register(release_instance_lock)
 
 
 # -----------------------------------------------------------------------------
@@ -1143,11 +1222,19 @@ async def main() -> None:
     log.info(f"  Risk: {RISK_PERCENT}% | Gales: {MAX_GALES} | Countdown: {COUNTDOWN_SECS}s")
     log.info("=" * 55)
 
+    if not acquire_instance_lock():
+        # Keep process alive but passive to avoid PM2 restart loops and duplicate trades.
+        while True:
+            await asyncio.sleep(300)
+
     if not all([TG_SESSION, TG_API_ID, TG_API_HASH]):
         log.error("Missing TG credentials in .env")
         return
     if not ALERT_BOT_TOKEN or not ALERT_CHAT_ID:
         log.error("Missing ALERT_BOT_TOKEN or ALERT_CHAT_ID in .env")
+        return
+    if not IQ_EMAIL or not IQ_PASSWORD:
+        log.error("Missing IQ_EMAIL or IQ_PASSWORD in .env")
         return
 
     # connect IQ Option in executor
