@@ -902,6 +902,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Trade cancelled!")
 
 
+async def handle_polling_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Re-clear the Telegram session whenever a 409 Conflict occurs during polling."""
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        log.warning("409 Conflict during polling — re-clearing session...")
+        try:
+            await context.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+    else:
+        log.error(f"Polling error: {context.error}")
+
+
 # ── MAGIC TRADER LISTENER ─────────────────────────────────────────────────────
 tg_listener = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
 
@@ -1029,6 +1043,7 @@ async def main():
     ptb_app.add_handler(CommandHandler("stats",   cmd_stats))
     ptb_app.add_handler(CommandHandler("report",  cmd_report))
     ptb_app.add_handler(CallbackQueryHandler(button_callback))
+    ptb_app.add_error_handler(handle_polling_error)
 
     async with ptb_app:
         alert_bot = ptb_app.bot
@@ -1036,17 +1051,23 @@ async def main():
         me = await alert_bot.get_me()
         log.info(f"Alert bot: @{me.username}")
 
-        # Delete any active webhook AND drop the previous getUpdates session.
-        # This is the only reliable way to clear a stale connection left by a
-        # previous run that was killed without a clean shutdown. Without this,
-        # Telegram keeps the old long-poll alive for up to ~60 s, causing 409s.
+        # Step 1: delete any active webhook
         log.info("Clearing any existing webhook / getUpdates session...")
         try:
             await alert_bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
             log.warning(f"delete_webhook: {e}")
-        # Give Telegram's servers time to tear down the old session.
-        await asyncio.sleep(3)
+
+        # Step 2: steal the long-poll slot — calling get_updates with timeout=0
+        # forces Telegram to close whatever previous session is still open.
+        try:
+            await alert_bot.get_updates(offset=-1, timeout=0)
+        except Exception:
+            pass
+
+        # Step 3: wait for Telegram's servers to fully close the old session.
+        log.info("Waiting 10s for Telegram session to settle...")
+        await asyncio.sleep(10)
 
         await alert_bot.send_message(
             chat_id=ALERT_CHAT_ID,
