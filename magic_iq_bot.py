@@ -34,24 +34,50 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 load_dotenv()
 
 # ── SINGLE-INSTANCE LOCK ──────────────────────────────────────────────────────
-# Bind a TCP socket on localhost so a second launch fails immediately instead
-# of fighting the first process for Telegram's getUpdates slot.
 _LOCK_PORT = 47832
 _lock_socket = None
 
 def _acquire_instance_lock():
+    """
+    Prevent two copies of the bot from running simultaneously.
+
+    Strategy — connect-first, then bind:
+      1. Probe the port with a short connect(). If it succeeds, a live
+         listener exists → another instance is running → exit.
+      2. If connect() is refused (nothing listening), bind our own
+         listener with SO_REUSEADDR=True. This succeeds immediately even
+         if the OS is still in the brief post-kill cleanup window where
+         a plain bind() without SO_REUSEADDR would fail.
+    """
     global _lock_socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(1)
+    alive = False
     try:
-        s.bind(("127.0.0.1", _LOCK_PORT))
-    except OSError:
+        probe.connect(("127.0.0.1", _LOCK_PORT))
+        alive = True
+    except (ConnectionRefusedError, OSError):
+        pass
+    finally:
+        probe.close()
+
+    if alive:
         print(
-            f"[FATAL] Another instance of this bot is already running "
-            f"(port {_LOCK_PORT} is taken). Kill the old process first."
+            "[FATAL] Another instance of this bot is already running.\n"
+            "Run:  taskkill /F /IM python.exe   then try again."
         )
         sys.exit(1)
-    _lock_socket = s  # keep reference so the socket stays bound
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", _LOCK_PORT))
+        s.listen(1)
+    except OSError as e:
+        print(f"[FATAL] Could not acquire instance lock: {e}")
+        sys.exit(1)
+    _lock_socket = s  # keep alive for the lifetime of the process
 
 # ── ANALYTICS DB ──────────────────────────────────────────────────────────────
 TRADES_FILE = os.environ.get(
