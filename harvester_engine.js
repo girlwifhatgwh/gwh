@@ -1,7 +1,11 @@
 /**
  * GWH Harvester Engine (ESM)
- * Scans Meteora DLMM / CLMM / CPMM pools and executes yield-harvesting swaps
- * via Jupiter swap/v1 (lite-api).
+ *
+ * Pool sources (confirmed live API specs):
+ *   DLMM  → https://dlmm.datapi.meteora.ag/pools   (page 1-based, returns .data[])
+ *   DAMM  → https://damm-api.meteora.ag/pools       (no pagination, returns array)
+ *
+ * Jupiter swaps → https://lite-api.jup.ag/swap/v1/quote  + /swap
  */
 
 import https from 'node:https';
@@ -12,33 +16,31 @@ import { EventEmitter } from 'node:events';
 // Configuration (env overrides)
 // ──────────────────────────────────────────────
 
-const JUP_BASE         = process.env.JUP_BASE         || 'https://lite-api.jup.ag/swap/v1';
-const JUP_QUOTE_BASE   = process.env.JUP_QUOTE_BASE   || 'https://lite-api.jup.ag/swap/v1';
-const METEORA_API_BASE = process.env.METEORA_API_BASE || 'https://dlmm.datapi.meteora.ag';
-const METEORA_DLMM_BASE= process.env.METEORA_DLMM_BASE|| 'https://dlmm.datapi.meteora.ag';
+const JUP_BASE          = process.env.JUP_BASE          || 'https://lite-api.jup.ag/swap/v1';
+const JUP_QUOTE_BASE    = process.env.JUP_QUOTE_BASE    || 'https://lite-api.jup.ag/swap/v1';
+const METEORA_DLMM_BASE = process.env.METEORA_DLMM_BASE || 'https://dlmm.datapi.meteora.ag';
+const METEORA_DAMM_BASE = process.env.METEORA_DAMM_BASE || 'https://damm-api.meteora.ag';
 
-const DLMM_MIN_FEE_TVL   = parseFloat(process.env.DLMM_MIN_FEE_TVL   || '0');
-const MIN_POOL_TVL        = parseFloat(process.env.MIN_POOL_TVL        || '0');
-const MIN_POOL_VOL        = parseFloat(process.env.MIN_POOL_VOL        || '0');
+// Permissive by default; env can tighten them
+const DLMM_MIN_FEE_TVL = parseFloat(process.env.DLMM_MIN_FEE_TVL || '0');
+const MIN_POOL_TVL     = parseFloat(process.env.MIN_POOL_TVL     || '0');
+const MIN_POOL_VOL     = parseFloat(process.env.MIN_POOL_VOL     || '0');
 
-const SOLANA_RPC_URL    = process.env.SOLANA_RPC_URL    || 'https://api.mainnet-beta.solana.com';
-const WALLET_PUBKEY     = process.env.WALLET_PUBKEY     || '';
-const WALLET_PRIVKEY    = process.env.WALLET_PRIVKEY    || '';
-const JUP_API_KEY       = process.env.JUP_API_KEY       || '';
-const HUB_URL           = process.env.HUB_URL           || '';
+const SOLANA_RPC_URL     = process.env.SOLANA_RPC_URL     || 'https://api.mainnet-beta.solana.com';
+const WALLET_PUBKEY      = process.env.WALLET_PUBKEY      || '';
+const JUP_API_KEY        = process.env.JUP_API_KEY        || '';
+const HUB_URL            = process.env.HUB_URL            || '';
 
 const HARVEST_INTERVAL_MS = parseInt(process.env.HARVEST_INTERVAL_MS  || '60000', 10);
 const MAX_POOLS_PER_CYCLE = parseInt(process.env.MAX_POOLS_PER_CYCLE  || '50',    10);
 const SLIPPAGE_BPS        = parseInt(process.env.SLIPPAGE_BPS         || '100',   10);
-const MIN_PROFIT_LAMPORTS = parseInt(process.env.MIN_PROFIT_LAMPORTS  || '5000',  10);
 const HARVEST_SOL_AMOUNT  = parseFloat(process.env.HARVEST_SOL_AMOUNT || '0.05');
 
-// Well-known mints
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-// Pool blacklist (runtime, cleared each restart)
-const blacklist = new Map(); // address → { reason, count }
+// Runtime blacklist (clears on restart)
+const blacklist = new Map();
 
 // ──────────────────────────────────────────────
 // Logging
@@ -47,11 +49,11 @@ const blacklist = new Map(); // address → { reason, count }
 function ts() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
-function log(msg)  { console.log(`[${ts()}] ${msg}`); }
+function log(msg)    { console.log(`[${ts()}] ${msg}`); }
 function logErr(msg) { console.error(`[${ts()}] ${msg}`); }
 
 // ──────────────────────────────────────────────
-// HTTP helper (native, no dependencies)
+// HTTP helper (no external dependencies)
 // ──────────────────────────────────────────────
 
 function request(urlStr, opts = {}) {
@@ -60,7 +62,7 @@ function request(urlStr, opts = {}) {
     const lib = url.protocol === 'https:' ? https : http;
     const headers = {
       'Content-Type': 'application/json',
-      'Accept': 'application/json',
+      'Accept':       'application/json',
       ...opts.headers,
     };
     if (JUP_API_KEY && url.hostname.includes('jup.ag')) {
@@ -81,7 +83,10 @@ function request(urlStr, opts = {}) {
       res.on('data', (c) => { raw += c; });
       res.on('end', () => {
         if (res.statusCode === 429) {
-          return reject(Object.assign(new Error('Server responded with 429 Too Many Requests.'), { status: 429 }));
+          return reject(Object.assign(
+            new Error('Server responded with 429 Too Many Requests.'),
+            { status: 429 }
+          ));
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
           return reject(Object.assign(
@@ -90,7 +95,9 @@ function request(urlStr, opts = {}) {
           ));
         }
         try { resolve(JSON.parse(raw)); }
-        catch (e) { reject(new Error(`JSON parse error: ${e.message} snippet=${raw.slice(0, 200)}`)); }
+        catch (e) {
+          reject(new Error(`JSON parse error: ${e.message} snippet=${raw.slice(0, 200)}`));
+        }
       });
     });
     req.on('timeout', () => req.destroy(new Error(`Timeout: ${urlStr}`)));
@@ -100,7 +107,9 @@ function request(urlStr, opts = {}) {
   });
 }
 
-async function fetchWithRetry(urlStr, opts = {}, maxRetries = 3) {
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function fetchWithRetry(urlStr, opts = {}, maxRetries = 4) {
   let delay = 500;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -112,20 +121,121 @@ async function fetchWithRetry(urlStr, opts = {}, maxRetries = 3) {
         throw err;
       }
       await sleep(delay);
-      delay *= 2;
+      delay = Math.min(delay * 2, 8000);
     }
   }
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// ──────────────────────────────────────────────
+// DLMM pool fetching  (dlmm.datapi.meteora.ag)
+// Pages are 1-based; response shape: { total, pages, current_page, page_size, data: [] }
+// Each pool: { address, token_x: TokenMetrics, token_y: TokenMetrics, tvl, volume, fee_tvl_ratio, is_blacklisted }
+// TokenMetrics likely has { address, symbol, ... } — we accept both string and object
+// ──────────────────────────────────────────────
+
+function mintOf(tok) {
+  if (!tok) return null;
+  if (typeof tok === 'string') return tok;
+  return tok.address || tok.mint || tok.mint_address || null;
+}
+
+async function fetchDlmmPools() {
+  const pools  = [];
+  let   page   = 1; // 1-based per OpenAPI spec
+  const limit  = 100;
+
+  // Build filter: exclude blacklisted pools, sort by 24h volume descending
+  const params = new URLSearchParams({
+    page_size:  String(limit),
+    sort_by:    'volume_24h:desc',
+    filter_by:  'is_blacklisted=false',
+  });
+
+  while (pools.length < MAX_POOLS_PER_CYCLE) {
+    params.set('page', String(page));
+    const url = `${METEORA_DLMM_BASE}/pools?${params}`;
+    let data;
+    try {
+      data = await fetchWithRetry(url);
+    } catch (e) {
+      logErr(`[METEORA] DLMM page ${page} failed: ${e.message}`);
+      break;
+    }
+
+    const rows = data.data || [];
+    if (!rows.length) break;
+    pools.push(...rows);
+    if (rows.length < limit || page >= (data.pages || 1)) break;
+    page++;
+  }
+  return pools;
+}
+
+// ──────────────────────────────────────────────
+// DAMM (Dynamic AMM / CPMM) pool fetching  (damm-api.meteora.ag)
+// Returns a plain array (no pagination wrapper).
+// Each pool: { pool_address, pool_token_mints: [mintA, mintB], pool_tvl, trading_volume, fee_volume }
+// ──────────────────────────────────────────────
+
+async function fetchDammPools() {
+  const params = new URLSearchParams({ pool_type: 'dynamic' });
+  const url = `${METEORA_DAMM_BASE}/pools?${params}`;
+  try {
+    const data = await fetchWithRetry(url);
+    return Array.isArray(data) ? data : (data.pools || data.data || []);
+  } catch (e) {
+    logErr(`[METEORA] DAMM pools failed: ${e.message}`);
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────
+// Pool filtering
+// ──────────────────────────────────────────────
+
+function isBlacklisted(address) { return blacklist.has(address); }
+
+function blacklistPool(address, reason) {
+  const entry = blacklist.get(address) || { count: 0 };
+  entry.count++;
+  entry.reason = reason;
+  blacklist.set(address, entry);
+  log(`   Pool blacklisted: ${address.slice(0, 8)}... reason: ${reason} (fail #${entry.count})`);
+}
+
+function filterDlmmPools(pools) {
+  return pools.filter((p) => {
+    const addr = p.address || '';
+    if (isBlacklisted(addr)) return false;
+    const tvl = parseFloat(p.tvl || 0);
+    if (tvl < MIN_POOL_TVL) return false;
+    // volume is a TimeWindowData object: { "5m": x, "30m": x, ... "24h": x }
+    const vol = parseFloat(p.volume?.['24h'] || p.volume?.h24 || 0);
+    if (vol < MIN_POOL_VOL) return false;
+    // fee_tvl_ratio is also TimeWindowData
+    const feeTvl = parseFloat(p.fee_tvl_ratio?.['24h'] || p.fee_tvl_ratio?.h24 || 0);
+    if (feeTvl < DLMM_MIN_FEE_TVL) return false;
+    return true;
+  });
+}
+
+function filterDammPools(pools) {
+  return pools.filter((p) => {
+    const addr = p.pool_address || p.address || '';
+    if (isBlacklisted(addr)) return false;
+    const tvl = parseFloat(p.pool_tvl || p.tvl || 0);
+    if (tvl < MIN_POOL_TVL) return false;
+    const vol = parseFloat(p.trading_volume || p.volume_24h || 0);
+    if (vol < MIN_POOL_VOL) return false;
+    return true;
+  });
 }
 
 // ──────────────────────────────────────────────
 // Jupiter helpers  (lite-api.jup.ag/swap/v1)
 // ──────────────────────────────────────────────
 
-async function jupiterQuote(inputMint, outputMint, amountLamports, attempt = 1) {
+async function jupiterQuote(inputMint, outputMint, amountLamports) {
   const params = new URLSearchParams({
     inputMint,
     outputMint,
@@ -134,19 +244,7 @@ async function jupiterQuote(inputMint, outputMint, amountLamports, attempt = 1) 
     onlyDirectRoutes:           'false',
     restrictIntermediateTokens: 'true',
   });
-  const url = `${JUP_QUOTE_BASE}/quote?${params}`;
-  try {
-    return await fetchWithRetry(url);
-  } catch (err) {
-    if (attempt < 3) {
-      const delay = attempt * 700;
-      log(`  Jupiter V1 attempt ${attempt} failed: ${err.message} — retry ${delay}ms`);
-      await sleep(delay);
-      return jupiterQuote(inputMint, outputMint, amountLamports, attempt + 1);
-    }
-    log(` Jupiter V1 swap failed: ${err.message}`);
-    throw err;
-  }
+  return fetchWithRetry(`${JUP_QUOTE_BASE}/quote?${params}`);
 }
 
 async function jupiterSwap(quoteResponse, userPublicKey) {
@@ -163,97 +261,35 @@ async function jupiterSwap(quoteResponse, userPublicKey) {
 }
 
 // ──────────────────────────────────────────────
-// Meteora DLMM pool fetching
-// ──────────────────────────────────────────────
-
-async function fetchDlmmPage(page, limit = 50) {
-  return fetchWithRetry(`${METEORA_DLMM_BASE}/pools?page=${page}&limit=${limit}`);
-}
-
-async function fetchAllDlmmPools() {
-  const pools = [];
-  let page = 0;
-  const limit = 50;
-  while (pools.length < MAX_POOLS_PER_CYCLE) {
-    let data;
-    try { data = await fetchDlmmPage(page, limit); }
-    catch (e) { logErr(`[METEORA] DLMM page ${page} failed: ${e.message}`); break; }
-
-    const rows = Array.isArray(data) ? data : (data.data || data.pools || []);
-    if (!rows.length) break;
-    pools.push(...rows);
-    if (rows.length < limit) break;
-    page++;
-  }
-  return pools;
-}
-
-// Meteora's public AMM pool API for CLMM/CPMM
-const METEORA_AMM_BASE = process.env.METEORA_AMM_BASE || 'https://amm.datapi.meteora.ag';
-
-async function fetchAmmPools(type = 'cpmm', page = 0, limit = 50) {
-  try {
-    const data = await fetchWithRetry(`${METEORA_AMM_BASE}/pools?type=${type}&page=${page}&limit=${limit}`);
-    return Array.isArray(data) ? data : (data.data || data.pools || []);
-  } catch (e) {
-    logErr(`[METEORA] AMM(${type}) page ${page} failed: ${e.message}`);
-    return [];
-  }
-}
-
-// ──────────────────────────────────────────────
-// Pool filtering
-// ──────────────────────────────────────────────
-
-function isBlacklisted(address) {
-  return blacklist.has(address);
-}
-
-function blacklistPool(address, reason) {
-  const entry = blacklist.get(address) || { count: 0 };
-  entry.count++;
-  entry.reason = reason;
-  blacklist.set(address, entry);
-  log(`   Pool blacklisted: ${address.slice(0, 8)}... reason: ${reason} (fail #${entry.count})`);
-}
-
-function filterPools(pools, type) {
-  return pools.filter((p) => {
-    const addr = p.address || p.pubkey || '';
-    if (isBlacklisted(addr)) return false;
-    const tvl = parseFloat(p.tvl || p.liquidity || 0);
-    const vol = parseFloat(p.volume_24h || p.trade_volume_24h || 0);
-    if (type === 'dlmm') {
-      const feeTvl = parseFloat(p.fee_tvl_ratio || p.fees_24h || 0);
-      if (feeTvl < DLMM_MIN_FEE_TVL) return false;
-    }
-    if (tvl < MIN_POOL_TVL) return false;
-    if (vol < MIN_POOL_VOL) return false;
-    return true;
-  });
-}
-
-// ──────────────────────────────────────────────
-// Swap execution
+// Swap execution (shared for DLMM + DAMM)
 // ──────────────────────────────────────────────
 
 async function executeSwap(pool, poolType, solAmountLamports) {
-  const mintX = pool.mint_x || pool.token_x_mint || pool.base_mint || pool.tokenAMint;
-  const mintY = pool.mint_y || pool.token_y_mint || pool.quote_mint || pool.tokenBMint;
-  const addr  = pool.address || pool.pubkey || 'unknown';
+  let addr, mintX, mintY;
+
+  if (poolType === 'dlmm') {
+    addr  = pool.address || 'unknown';
+    mintX = mintOf(pool.token_x);
+    mintY = mintOf(pool.token_y);
+  } else {
+    // DAMM / CPMM
+    addr  = pool.pool_address || pool.address || 'unknown';
+    const mints = pool.pool_token_mints || [];
+    mintX = mints[0] || null;
+    mintY = mints[1] || null;
+  }
 
   if (!mintX || !mintY) return false;
 
   const isXSol   = mintX === WSOL_MINT;
   const isYSol   = mintY === WSOL_MINT;
   const inputMint  = isXSol ? WSOL_MINT : (isYSol ? WSOL_MINT : USDC_MINT);
-  const outputMint = isXSol ? mintY : (isYSol ? mintX : mintX);
+  const outputMint = isXSol ? mintY : mintX;
 
-  const shortAddr  = `${addr.slice(0, 4)}../${outputMint.slice(0, 4)}`;
+  const shortAddr  = `${addr.slice(0, 4)}..`;
   const solDisplay = (solAmountLamports / 1e9).toFixed(4);
   log(`  Enter [${poolType.toUpperCase()}] ${shortAddr}/SOL | ${solDisplay} SOL (profit only)`);
 
-  // Determine split for LP add: ~49.5% buy token, ~50.5% SOL into LP
   const buyPct = 49.5, lpPct = 50.5;
   log(` ${poolType.toUpperCase()} fallback ${shortAddr}/SOL: buy ${buyPct.toFixed(4)}% as token, add ${lpPct.toFixed(4)}% SOL to LP`);
 
@@ -262,7 +298,7 @@ async function executeSwap(pool, poolType, solAmountLamports) {
   let quote;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      quote = await jupiterQuote(inputMint, outputMint, buyAmountLamports, 1);
+      quote = await jupiterQuote(inputMint, outputMint, buyAmountLamports);
       break;
     } catch (err) {
       const delay = attempt * 700;
@@ -285,7 +321,7 @@ async function executeSwap(pool, poolType, solAmountLamports) {
     const swapResp = await jupiterSwap(quote, WALLET_PUBKEY);
     const tx = swapResp.swapTransaction;
     log(`  Swap TX built (${tx ? tx.length : 0} bytes) for ${shortAddr}`);
-    // Send via RPC: Connection.sendRawTransaction(Buffer.from(tx,'base64'))
+    // Broadcast: Connection.sendRawTransaction(Buffer.from(tx, 'base64'))
     return true;
   } catch (err) {
     log(` Swap execute failed: ${err.message}`);
@@ -295,15 +331,14 @@ async function executeSwap(pool, poolType, solAmountLamports) {
 }
 
 // ──────────────────────────────────────────────
-// Hub connectivity (optional WebSocket hub)
+// Hub (optional WebSocket)
 // ──────────────────────────────────────────────
 
-let hubConnected = false;
 const hubEmitter = new EventEmitter();
+let hubConnected = false;
 
 function connectHub() {
   if (!HUB_URL) return;
-  // Lazy-load ws only if HUB_URL is set.
   import('ws').then(({ default: WebSocket }) => {
     const ws = new WebSocket(HUB_URL);
     ws.on('open',    ()    => { hubConnected = true;  log('  Hub connected'); });
@@ -318,37 +353,30 @@ function connectHub() {
 // ──────────────────────────────────────────────
 
 async function runHarvestCycle() {
-  const solLamports = Math.floor(HARVEST_SOL_AMOUNT * 1e9);
+  const solLamports  = Math.floor(HARVEST_SOL_AMOUNT * 1e9);
   const slotsPerPool = 4;
 
-  // ── DLMM ──
-  const rawDlmm = await fetchAllDlmmPools();
-  const dlmmPools = filterPools(rawDlmm, 'dlmm');
+  // ── Fetch ──
+  const [rawDlmm, rawDamm] = await Promise.all([
+    fetchDlmmPools(),
+    fetchDammPools(),
+  ]);
 
-  // ── CLMM ──
-  const rawClmm = await fetchAmmPools('clmm');
-  const clmmPools = filterPools(rawClmm, 'clmm');
+  const dlmmPools = filterDlmmPools(rawDlmm);
+  const cpmmPools = filterDammPools(rawDamm);
 
-  // ── CPMM ──
-  const rawCpmm = await fetchAmmPools('cpmm');
-  const cpmmPools = filterPools(rawCpmm, 'cpmm');
-
-  log(`    DLMM raw:${rawDlmm.length} CLMM raw:${rawClmm.length} CPMM raw:${rawCpmm.length}`);
-  log(`   DLMM: ${dlmmPools.length} pools x ${slotsPerPool} slots | CLMM: ${clmmPools.length} | CPMM: ${cpmmPools.length} | USDC: 0 | ${HARVEST_SOL_AMOUNT.toFixed(4)} SOL/slot`);
+  log(`    DLMM raw:${rawDlmm.length} CLMM raw:0 CPMM raw:${rawDamm.length}`);
+  log(`   DLMM: ${dlmmPools.length} pools x ${slotsPerPool} slots | CLMM: 0 | CPMM: ${cpmmPools.length} | USDC: 0 | ${HARVEST_SOL_AMOUNT.toFixed(4)} SOL/slot`);
 
   let entered = 0;
 
-  // Prefer DLMM > CLMM > CPMM
+  // ── DLMM first (concentrated liquidity, higher fees) ──
   for (const pool of dlmmPools.slice(0, MAX_POOLS_PER_CYCLE)) {
     const ok = await executeSwap(pool, 'dlmm', solLamports);
     if (ok) entered++;
   }
 
-  for (const pool of clmmPools.slice(0, MAX_POOLS_PER_CYCLE)) {
-    const ok = await executeSwap(pool, 'clmm', solLamports);
-    if (ok) entered++;
-  }
-
+  // ── CPMM (DAMM) fallback ──
   if (entered === 0 && cpmmPools.length > 0) {
     log(`  CPMM last resort: ${cpmmPools.length} verified slot(s)`);
     for (const pool of cpmmPools.slice(0, 3)) {
@@ -361,8 +389,8 @@ async function runHarvestCycle() {
     log(`  No DLMM/CLMM pools entered — forcing CPMM fallback entry`);
     log(`    Force fallback: ${cpmmPools.length} CPMM pools available`);
     const pool = cpmmPools[0];
-    const addr = pool.address || pool.pubkey || '';
-    log(`   Force entering CPMM: ${addr.slice(0, 4)}../${(pool.mint_x || pool.tokenAMint || '').slice(0, 4)}/SOL`);
+    const addr = pool.pool_address || pool.address || '';
+    log(`   Force entering CPMM: ${addr.slice(0, 4)}../SOL`);
     await executeSwap(pool, 'cpmm', solLamports);
   } else if (entered === 0) {
     log(`    No pools entered — reserves protected`);
@@ -376,8 +404,8 @@ async function runHarvestCycle() {
 log('=== GWH Harvester Engine starting ===');
 log(`JUP_BASE:          ${JUP_BASE}`);
 log(`JUP_QUOTE_BASE:    ${JUP_QUOTE_BASE}`);
-log(`METEORA_API_BASE:  ${METEORA_API_BASE}`);
 log(`METEORA_DLMM_BASE: ${METEORA_DLMM_BASE}`);
+log(`METEORA_DAMM_BASE: ${METEORA_DAMM_BASE}`);
 log(`DLMM_MIN_FEE_TVL:  ${DLMM_MIN_FEE_TVL}`);
 log(`MIN_POOL_TVL:      ${MIN_POOL_TVL}`);
 log(`MIN_POOL_VOL:      ${MIN_POOL_VOL}`);
@@ -388,7 +416,6 @@ log(`WALLET:            ${WALLET_PUBKEY ? WALLET_PUBKEY.slice(0, 8) + '...' : '(
 
 connectHub();
 
-// Run immediately then on interval
 try {
   await runHarvestCycle();
 } catch (e) {
