@@ -1,14 +1,21 @@
 {
   "name": "gwh-harvester",
-  "version": "1.0.0",
+  "version": "14.0.0",
   "type": "module",
-  "description": "GWH Harvester Engine — Meteora DLMM/DAMM yield harvesting via Jupiter",
+  "description": "GWH Harvester Engine v14.0 — DLMM + CPMM + CLMM + Copy-LP + Dual-Asset 6-Way Distribution",
   "main": "harvester_engine.js",
   "scripts": {
     "start": "node harvester_engine.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.3",
-    "bs58": "^6.0.0"
+    "@meteora-ag/dlmm": "^1.9.4",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.13.6",
+    "bn.js": "^5.2.3",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.6.1",
+    "p-queue": "^9.1.0",
+    "socket.io-client": "^4.8.3"
   }
 }
