@@ -379,7 +379,12 @@ ASSET_MAP = {
     "NZD/CHF": "NZDCHF-OTC",
     # Cross pairs
     "CAD/JPY": "CADJPY-OTC", "CHF/JPY": "CHFJPY-OTC",
-    # Metals (order matters — longer keys first for matching)
+    # EM / exotic USD pairs
+    "USD/ARS": "USDARS-OTC", "USD/COP": "USDCOP-OTC", "USD/PEN": "USDPEN-OTC",
+    "USD/CLP": "USDCLP-OTC", "USD/EGP": "USDEGP-OTC", "USD/NGN": "USDNGN-OTC",
+    "USD/KES": "USDKES-OTC", "USD/GHS": "USDGHS-OTC", "USD/MAD": "USDMAD-OTC",
+    "USD/PKR": "USDPKR-OTC", "USD/BDT": "USDBDT-OTC",
+    # Metals
     "XAU/USD": "XAUUSD-OTC", "XAG/USD": "XAGUSD-OTC",
     "XAUUSD":  "XAUUSD-OTC", "XAGUSD":  "XAGUSD-OTC",
     "GOLD":    "XAUUSD-OTC", "SILVER":  "XAGUSD-OTC",
@@ -404,6 +409,8 @@ LIVE_ASSET_MAP = {
     "USD/CZK": "USDCZK", "USD/THB": "USDTHB", "USD/HKD": "USDHKD",
     "USD/INR": "USDINR", "USD/IDR": "USDIDR", "USD/MYR": "USDMYR",
     "USD/PHP": "USDPHP", "USD/CNH": "USDCNH", "USD/SGD": "USDSGD",
+    "USD/ARS": "USDARS", "USD/COP": "USDCOP", "USD/PEN": "USDPEN",
+    "USD/CLP": "USDCLP", "USD/EGP": "USDEGP",
     # AUD pairs
     "AUD/USD": "AUDUSD", "AUD/JPY": "AUDJPY", "AUD/CAD": "AUDCAD",
     "AUD/NZD": "AUDNZD", "AUD/CHF": "AUDCHF",
@@ -462,39 +469,45 @@ def iq_place_trade(asset: str, direction: str, amount: float, expiry_min: int) -
                 return False
 
         if is_demo:
-            iq_asset = ASSET_MAP.get(asset, asset)
+            preferred = ASSET_MAP.get(asset, asset)
         else:
-            iq_asset = LIVE_ASSET_MAP.get(asset, ASSET_MAP.get(asset, asset))
+            preferred = LIVE_ASSET_MAP.get(asset, ASSET_MAP.get(asset, asset))
+
+        # Build a list of asset name variants to try in order:
+        # preferred → non-OTC → OTC → raw stripped name
+        candidates = [preferred]
+        without_otc = preferred.replace("-OTC", "")
+        with_otc    = without_otc + "-OTC"
+        for v in (without_otc, with_otc, asset.replace("/", "")):
+            if v not in candidates:
+                candidates.append(v)
 
         action = "call" if direction == "call" else "put"
-        log.info(f"Placing: {iq_asset} {action} ${amount} {expiry_min}min [{mode()}]")
-        check, order_id = iq_api.buy(amount, iq_asset, action, expiry_min)
 
-        if check:
-            log.info(f"TRADE PLACED! Order: {order_id}")
-            time.sleep(1)
-            bal = iq_api.get_balance()
-            if bal:
-                account_balance = float(bal)
-            return True
+        for iq_asset in candidates:
+            try:
+                log.info(f"Trying: {iq_asset} {action} ${amount} {expiry_min}min [{mode()}]")
+                check, order_id = iq_api.buy(amount, iq_asset, action, expiry_min)
+                if check:
+                    log.info(f"TRADE PLACED! {iq_asset} Order: {order_id}")
+                    time.sleep(1)
+                    bal = iq_api.get_balance()
+                    if bal:
+                        account_balance = float(bal)
+                    return True
+                log.warning(f"buy() rejected {iq_asset}: {order_id}")
+            except Exception as e:
+                log.warning(f"buy() error on {iq_asset}: {e}")
 
-        # Fallback: try non-OTC variant
-        iq_asset2 = iq_asset.replace("-OTC", "")
-        log.info(f"Retrying non-OTC: {iq_asset2}")
-        check2, order_id2 = iq_api.buy(amount, iq_asset2, action, expiry_min)
-        if check2:
-            log.info(f"TRADE PLACED (non-OTC)! Order: {order_id2}")
-            bal = iq_api.get_balance()
-            if bal:
-                account_balance = float(bal)
-            return True
-
-        log.error(f"Trade failed: {order_id}")
+        log.error(f"All variants failed for {asset}")
         return False
 
     except Exception as e:
         log.error(f"Trade error: {e}")
-        iq_connect()
+        try:
+            iq_connect()
+        except Exception:
+            pass
         return False
 
 
