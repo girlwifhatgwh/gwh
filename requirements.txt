@@ -1,0 +1,4 @@
+MetaTrader5>=5.0.45
+telethon>=1.36.0
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
