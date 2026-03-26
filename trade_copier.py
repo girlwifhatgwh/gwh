@@ -97,9 +97,9 @@ RR_CONFIG = {
 }
 
 
-# ─────────────────────────────────────────────
-#  MASTER ACCOUNTS
-# ─────────────────────────────────────────────
+# ===========================
+# MASTER ACCOUNTS CONFIGURATION
+# ===========================
 MASTER_ACCOUNTS = {
     "Master1": {
         "enabled":      True,
@@ -111,7 +111,7 @@ MASTER_ACCOUNTS = {
         "magic_number": 123456,
         "deviation":    300,
         "max_lot":      10.0,
-        "channels":     [-1002034822451, -1001588519179, -1002053336791],
+        "channels":     [-1002034822451, -1001588519179, -1002495224665],
         "json_file":    r"C:\AI_Signal\master_trades_51647558.json",
     },
     "Master2": {
@@ -129,9 +129,13 @@ MASTER_ACCOUNTS = {
     },
 }
 
+# ===========================
+# SLAVE ACCOUNTS CONFIGURATION
+# ===========================
 SLAVE_ACCOUNTS = {
     "Slave2": {
         "enabled":          True,
+        "name":             "Slave2",
         "account":          7314281,
         "password":         "Ugoprince!@555",
         "server":           "ICMarketsSC-MT5-2",
@@ -142,10 +146,33 @@ SLAVE_ACCOUNTS = {
         "max_lot":          10.0,
         "copy_from_master": 51647558,
     },
-    # Uncomment and fill in to activate more slaves:
-    # "Slave3": { ... "copy_from_master": 51647558 },
-    # "Slave4": { ... "copy_from_master": 51647558 },
-    # "Slave5": { ... "copy_from_master": 161443437 },
+    # ── Add more slaves below ────────────────────────────────────────────────
+    # "Slave3": {
+    #     "enabled":          True,
+    #     "name":             "Slave3",
+    #     "account":          0,
+    #     "password":         "",
+    #     "server":           "",
+    #     "mt5_path":         r"C:\MT5\SLAVE3\terminal64.exe",
+    #     "lot_multiplier":   1.0,
+    #     "magic_number":     999997,
+    #     "deviation":        300,
+    #     "max_lot":          10.0,
+    #     "copy_from_master": 51647558,   # 51647558=Master1 | 161443437=Master2
+    # },
+    # "Slave4": {
+    #     "enabled":          True,
+    #     "name":             "Slave4",
+    #     "account":          0,
+    #     "password":         "",
+    #     "server":           "",
+    #     "mt5_path":         r"C:\MT5\SLAVE4\terminal64.exe",
+    #     "lot_multiplier":   1.0,
+    #     "magic_number":     999996,
+    #     "deviation":        300,
+    #     "max_lot":          10.0,
+    #     "copy_from_master": 161443437,
+    # },
 }
 
 
