@@ -20,7 +20,6 @@ import logging
 import json
 import time
 import ssl
-import socket
 import threading
 import sys
 
@@ -33,51 +32,64 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 load_dotenv()
 
-# ── SINGLE-INSTANCE LOCK ──────────────────────────────────────────────────────
-_LOCK_PORT = 47832
-_lock_socket = None
+# ── SINGLE-INSTANCE LOCK (PID-file based) ────────────────────────────────────
+_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.lock")
+
+
+def _pid_is_running(pid: int) -> bool:
+    """Return True if a process with this PID is currently alive."""
+    if pid == os.getpid():
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists but we lack permission to signal it
+
 
 def _acquire_instance_lock():
     """
-    Prevent two copies of the bot from running simultaneously.
-
-    Strategy — connect-first, then bind:
-      1. Probe the port with a short connect(). If it succeeds, a live
-         listener exists → another instance is running → exit.
-      2. If connect() is refused (nothing listening), bind our own
-         listener with SO_REUSEADDR=True. This succeeds immediately even
-         if the OS is still in the brief post-kill cleanup window where
-         a plain bind() without SO_REUSEADDR would fail.
+    Write our PID to a lock file. If the file already exists and its PID
+    belongs to a live process, a real duplicate is running → exit.
+    After taskkill the old PID is dead, so we take over immediately —
+    no port-timing issues, no OS cleanup windows to worry about.
     """
-    global _lock_socket
+    if os.path.exists(_LOCK_FILE):
+        try:
+            old_pid = int(open(_LOCK_FILE).read().strip())
+            if _pid_is_running(old_pid):
+                print(
+                    f"[FATAL] Another instance is already running (PID {old_pid}).\n"
+                    f"Kill it with:  taskkill /F /PID {old_pid}\n"
+                    f"Or kill all:   taskkill /F /IM python.exe"
+                )
+                sys.exit(1)
+        except (ValueError, OSError):
+            pass  # corrupt/missing file — proceed
 
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.settimeout(1)
-    alive = False
-    try:
-        probe.connect(("127.0.0.1", _LOCK_PORT))
-        alive = True
-    except (ConnectionRefusedError, OSError):
-        pass
-    finally:
-        probe.close()
+    with open(_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
 
-    if alive:
-        print(
-            "[FATAL] Another instance of this bot is already running.\n"
-            "Run:  taskkill /F /IM python.exe   then try again."
-        )
-        sys.exit(1)
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", _LOCK_PORT))
-        s.listen(1)
-    except OSError as e:
-        print(f"[FATAL] Could not acquire instance lock: {e}")
-        sys.exit(1)
-    _lock_socket = s  # keep alive for the lifetime of the process
+    import atexit
+    def _remove_lock():
+        try:
+            os.unlink(_LOCK_FILE)
+        except OSError:
+            pass
+    atexit.register(_remove_lock)
 
 # ── ANALYTICS DB ──────────────────────────────────────────────────────────────
 TRADES_FILE = os.environ.get(
