@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
@@ -798,7 +798,7 @@ async def on_magic_trader(event):
         return
     _seen_signals.add(sig_hash)
     if len(_seen_signals) > 200:
-        _seen_signals.pop()
+        _seen_signals.discard(next(iter(_seen_signals)))
 
     # Check for result message first
     result = parse_result(text)
@@ -893,36 +893,10 @@ async def main():
 
     threading.Thread(target=iq_keepalive, daemon=True).start()
 
-    alert_bot = Bot(token=ALERT_BOT_TOKEN)
-    me = await alert_bot.get_me()
-    log.info(f"Alert bot: @{me.username}")
-
-    await alert_bot.send_message(
-        chat_id=ALERT_CHAT_ID,
-        text=(
-            "Magic Trader → IQ Option Bot v1.0 Started!\n\n"
-            f"IQ Option: {'Connected' if connected else 'Use /connect'}\n"
-            f"Mode:      {mode()}\n"
-            f"Balance:   ${account_balance:.2f}\n"
-            f"Stake:     ${calculate_stake(account_balance):.2f}\n"
-            f"Gale 1:    ${calculate_stake(account_balance, 1):.2f}\n"
-            f"Gale 2:    ${calculate_stake(account_balance, 2):.2f}\n"
-            f"BRT:       {brt_now()}\n\n"
-            "Commands:\n"
-            "/demo      - use demo account\n"
-            "/real      - use real account\n"
-            "/connect   - reconnect IQ Option\n"
-            "/balance   - check balance\n"
-            "/risk 5    - change risk %\n"
-            "/status    - full status\n"
-            "/trades    - recent trade results\n"
-            "/stats     - 7-day performance\n"
-            "/report    - 30-day performance\n"
-            "/brt       - Brazil time\n\n"
-            "Watching Magic Trader... Trade fires 30s before entry!"
-        ),
-    )
-
+    # Build the PTB Application first; reuse its internal bot as alert_bot.
+    # Creating a separate Bot() instance with the same token would cause a
+    # Telegram 409 Conflict because both would open competing getUpdates
+    # long-poll connections.
     ptb_app = Application.builder().token(ALERT_BOT_TOKEN).build()
     ptb_app.add_handler(CommandHandler("status",  cmd_status))
     ptb_app.add_handler(CommandHandler("balance", cmd_balance))
@@ -937,6 +911,39 @@ async def main():
     ptb_app.add_handler(CallbackQueryHandler(button_callback))
 
     async with ptb_app:
+        # ptb_app.__aenter__ calls initialize(), which sets up the HTTP client.
+        # Point alert_bot at the same Bot object — no second connection.
+        alert_bot = ptb_app.bot
+
+        me = await alert_bot.get_me()
+        log.info(f"Alert bot: @{me.username}")
+
+        await alert_bot.send_message(
+            chat_id=ALERT_CHAT_ID,
+            text=(
+                "Magic Trader → IQ Option Bot v1.0 Started!\n\n"
+                f"IQ Option: {'Connected' if connected else 'Use /connect'}\n"
+                f"Mode:      {mode()}\n"
+                f"Balance:   ${account_balance:.2f}\n"
+                f"Stake:     ${calculate_stake(account_balance):.2f}\n"
+                f"Gale 1:    ${calculate_stake(account_balance, 1):.2f}\n"
+                f"Gale 2:    ${calculate_stake(account_balance, 2):.2f}\n"
+                f"BRT:       {brt_now()}\n\n"
+                "Commands:\n"
+                "/demo      - use demo account\n"
+                "/real      - use real account\n"
+                "/connect   - reconnect IQ Option\n"
+                "/balance   - check balance\n"
+                "/risk 5    - change risk %\n"
+                "/status    - full status\n"
+                "/trades    - recent trade results\n"
+                "/stats     - 7-day performance\n"
+                "/report    - 30-day performance\n"
+                "/brt       - Brazil time\n\n"
+                "Watching Magic Trader... Trade fires 30s before entry!"
+            ),
+        )
+
         await ptb_app.start()
         await ptb_app.updater.start_polling(drop_pending_updates=True)
 
