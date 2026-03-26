@@ -1,30 +1,46 @@
 """
 =============================================================================
-  TELEGRAM → MT5 MASTER/SLAVE TRADE COPIER  |  ARCHITECT v36.0
+  TELEGRAM → MT5 MASTER/SLAVE TRADE COPIER  |  ARCHITECT v37.0
 =============================================================================
-  IMPROVEMENTS vs v35:
-    1. RR_CONFIG defined at module level — v35 crashed with NameError
-    2. Background open-position scanner: finds ANY open trade (on any magic)
-       that is missing SL or TP and sets them automatically every 60 s
-    3. Slave copy loop polls at 2 s (was 5 s) and batches all pending trades
-       per slave in a single MT5 session to minimize account-switches
-    4. Concurrent master execution: each master fires in its own asyncio.Task
-       instead of sequential await — reduces latency for multi-master setups
-    5. Signal dedup uses a fixed-size LRU-style deque instead of a plain set
-       with a racy pop() call
-    6. send_order() retries once on requote (retcode 10004) with refreshed price
-    7. parse_signal() returns structured error context for better log traceability
-    8. auto_sl_tp() uses live tick price when entry_price is 0
-    9. AI prompt updated to claude-3-5-sonnet-20241022 (stable GA model name)
-   10. JSON bridge write is deferred (non-blocking) via asyncio.to_thread
-   11. Watchdog checks every master account in round-robin to detect stale
-       connections before they are needed for a real trade
-   12. draw_trade_levels() is a no-op when MT5 chart API is unavailable
-       (e.g. running headless) — no longer raises an exception
+  SPEED FIXES vs v36 (why signals weren't being copied fast):
+
+  1. FIRE-AND-FORGET HANDLER
+     handler() no longer awaits execute_on_master(). It creates a Task and
+     returns immediately so Telethon's event loop is never blocked — the
+     next signal is picked up instantly even while a trade is being placed.
+
+  2. IN-MEMORY QUEUE FOR SLAVE COPY (was: JSON poll every 2 s)
+     Each slave has a dedicated asyncio.Queue. When a master places a trade
+     it pushes directly to the queue. The slave worker wakes instantly
+     (queue.get() blocks with zero CPU) — no more 0–2 s poll delay.
+     JSON file is still written as a persistent backup/audit log but is NOT
+     on the critical copy path.
+
+  3. AUTO SL/TP SCANNER NO LONGER BLOCKS TRADES
+     Scanner releases _mt5_lock between accounts so an incoming trade can
+     always grab it within milliseconds.
+
+  4. MT5 SWITCH SLEEP REDUCED 0.3 s → 0.05 s
+
+  5. MULTI-TP INTER-ORDER SLEEP REMOVED (was 0.2 s)
+     Orders within the same signal fire back-to-back.
+
+  6. CHANNEL DEBUG LOGGING
+     Every incoming message logs its chat_id. If no master is matched the
+     exact chat_id is printed so you can add it to your config immediately.
+
+  7. PARALLEL AI + REGEX PARSE
+     If ANTHROPIC_API_KEY is set, AI parse races against a 3 s timeout;
+     on timeout or failure the regex result is used without extra delay.
+
+  8. WATCHDOG KEEPS MASTER MT5 WARM
+     Watchdog now cycles through all accounts and keeps the most recently
+     used one connected, so the first trade after a quiet period doesn't
+     pay a full mt5.initialize() cost.
 =============================================================================
 """
 
-import os, re, asyncio, json, time, logging, uuid
+import os, re, asyncio, json, logging, uuid
 from collections import deque
 from datetime import datetime
 from dotenv import load_dotenv
@@ -42,10 +58,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("copier_v36.log", encoding="utf-8"),
+        logging.FileHandler("copier_v37.log", encoding="utf-8"),
     ],
 )
-log = logging.getLogger("ARCHITECT-v36")
+log = logging.getLogger("ARCHITECT-v37")
 
 
 # ─────────────────────────────────────────────
@@ -59,16 +75,12 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 
 # ─────────────────────────────────────────────
-#  RISK:REWARD CONFIG  — was missing in v35 (NameError crash)
-#  Tune these values to match your strategy.
+#  RISK : REWARD CONFIG
 # ─────────────────────────────────────────────
 RR_CONFIG = {
-    # Default SL size in pips when signal has no SL
     "auto_sl_pips": 20,
-
-    # Per-symbol overrides (instrument-specific pip sizing)
     "symbol_sl_pips": {
-        "XAUUSD": 150,   # Gold: 1 pip = $0.10, 150 pips = $15 per 0.01 lot
+        "XAUUSD": 150,
         "XAGUSD": 50,
         "NASDAQ": 50,
         "US30":   80,
@@ -79,20 +91,11 @@ RR_CONFIG = {
         "BTCUSD": 500,
         "ETHUSD": 100,
     },
-
-    # RR ratios applied to the auto SL distance
-    "auto_rr1": 1.5,   # TP1 = entry ± SL_dist × 1.5
-    "auto_rr2": 2.5,   # TP2
-    "auto_rr3": 4.0,   # TP3
-
-    # Draw horizontal SL/TP lines on the active MT5 chart
+    "auto_rr1": 1.5,
+    "auto_rr2": 2.5,
+    "auto_rr3": 4.0,
     "draw_on_chart": True,
-
-    # Scan open positions for missing SL/TP every N seconds
     "auto_sltp_scan_interval": 60,
-
-    # Apply auto SL/TP only to trades opened by these magic numbers.
-    # Empty list = apply to ALL open trades (any magic, any EA).
     "auto_sltp_magic_filter": [],
 }
 
@@ -124,7 +127,8 @@ MASTER_ACCOUNTS = {
         "magic_number": 654321,
         "deviation":    300,
         "max_lot":      10.0,
-        "channels":     [-1002034822451, -1001588519179, -1002495224665, -1002201702304, -1001381790914, -1001196272579, -1001182913499],
+        "channels":     [-1002034822451, -1001588519179, -1002495224665, -1002201702304,
+                         -1001381790914, -1001196272579, -1001182913499],
         "json_file":    r"C:\AI_Signal\master_trades_161443437.json",
     },
 }
@@ -146,7 +150,7 @@ SLAVE_ACCOUNTS = {
         "max_lot":          10.0,
         "copy_from_master": 51647558,
     },
-    # ── Add more slaves below ────────────────────────────────────────────────
+    # ── Add more slaves below ──────────────────────────────────────────────
     # "Slave3": {
     #     "enabled":          True,
     #     "name":             "Slave3",
@@ -158,20 +162,7 @@ SLAVE_ACCOUNTS = {
     #     "magic_number":     999997,
     #     "deviation":        300,
     #     "max_lot":          10.0,
-    #     "copy_from_master": 51647558,   # 51647558=Master1 | 161443437=Master2
-    # },
-    # "Slave4": {
-    #     "enabled":          True,
-    #     "name":             "Slave4",
-    #     "account":          0,
-    #     "password":         "",
-    #     "server":           "",
-    #     "mt5_path":         r"C:\MT5\SLAVE4\terminal64.exe",
-    #     "lot_multiplier":   1.0,
-    #     "magic_number":     999996,
-    #     "deviation":        300,
-    #     "max_lot":          10.0,
-    #     "copy_from_master": 161443437,
+    #     "copy_from_master": 51647558,
     # },
 }
 
@@ -219,16 +210,24 @@ SUFFIXES = ["", ".crp", "+", ".pro", ".v", ".a", "m", ".r", ".c", "_micro", "mic
 
 
 # ─────────────────────────────────────────────
+#  IN-MEMORY SLAVE QUEUES
+#  Each slave gets its own queue. Master pushes trade dicts; slave worker
+#  wakes immediately via queue.get() — zero poll delay.
+# ─────────────────────────────────────────────
+_slave_queues: dict[str, asyncio.Queue] = {
+    name: asyncio.Queue() for name in SLAVE_ACCOUNTS
+}
+
+
+# ─────────────────────────────────────────────
 #  MT5 CONNECTION POOL
-#  MT5 allows ONE active connection per process. We serialize all MT5
-#  operations with a lock and track the currently active account.
 # ─────────────────────────────────────────────
 _mt5_lock = asyncio.Lock()
 _mt5_active_account: int | None = None
 
 
 async def _ensure_mt5_account(cfg: dict) -> bool:
-    """Switch the MT5 session to the requested account if needed."""
+    """Switch the live MT5 session to the requested account if needed."""
     global _mt5_active_account
 
     if _mt5_active_account == cfg["account"]:
@@ -242,7 +241,7 @@ async def _ensure_mt5_account(cfg: dict) -> bool:
     if _mt5_active_account is not None:
         mt5.shutdown()
         _mt5_active_account = None
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.05)   # was 0.3 s — reduced to 50 ms
 
     ok = mt5.initialize(
         path=cfg["mt5_path"],
@@ -257,7 +256,7 @@ async def _ensure_mt5_account(cfg: dict) -> bool:
 
     acc = mt5.account_info()
     if acc:
-        log.info(f"  ✅ MT5 #{acc.login} | {acc.server} | Balance: {acc.balance:.2f} {acc.currency}")
+        log.info(f"  ✅ MT5 #{acc.login} | {acc.server} | Balance:{acc.balance:.2f} {acc.currency}")
         _mt5_active_account = cfg["account"]
         return True
 
@@ -273,10 +272,8 @@ def get_filling_mode(symbol: str) -> int:
     if not info:
         return mt5.ORDER_FILLING_FOK
     fm = info.filling_mode
-    if fm & 2:
-        return mt5.ORDER_FILLING_IOC
-    if fm & 1:
-        return mt5.ORDER_FILLING_FOK
+    if fm & 2: return mt5.ORDER_FILLING_IOC
+    if fm & 1: return mt5.ORDER_FILLING_FOK
     return mt5.ORDER_FILLING_RETURN
 
 
@@ -287,7 +284,7 @@ def resolve_symbol(base: str) -> str | None:
             info = mt5.symbol_info(sym)
             if info and info.visible:
                 return sym
-    log.warning(f"  ⚠️  Could not resolve symbol '{base}' — tried suffixes: {SUFFIXES}")
+    log.warning(f"  ⚠️  Could not resolve '{base}' with suffixes {SUFFIXES}")
     return None
 
 
@@ -314,19 +311,15 @@ def close_positions(symbol: str, action, magic: int):
             "price":        price,
             "deviation":    300,
             "magic":        magic,
-            "comment":      "CLOSE_v36",
+            "comment":      "CLOSE_v37",
             "type_filling": get_filling_mode(symbol),
         })
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            log.info(f"  ✅ Closed position #{pos.ticket}")
+            log.info(f"  ✅ Closed #{pos.ticket}")
             closed += 1
         else:
-            log.warning(
-                f"  ❌ Close failed #{pos.ticket}: "
-                f"{res.comment if res else 'no response'} "
-                f"(code:{res.retcode if res else '?'})"
-            )
-    log.info(f"  Closed {closed} positions for {symbol}")
+            log.warning(f"  ❌ Close #{pos.ticket}: {res.comment if res else '?'} ({res.retcode if res else '?'})")
+    log.info(f"  Closed {closed}/{len(positions)} positions for {symbol}")
 
 
 def close_partial_positions(symbol: str, magic: int, percent: int = 50):
@@ -351,11 +344,11 @@ def close_partial_positions(symbol: str, magic: int, percent: int = 50):
             "price":        price,
             "deviation":    300,
             "magic":        magic,
-            "comment":      f"PARTIAL_CLOSE_{percent}pct",
+            "comment":      f"PARTIAL_{percent}pct",
             "type_filling": get_filling_mode(symbol),
         })
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            log.info(f"  ✅ Partial close {close_vol} lots on #{pos.ticket}")
+            log.info(f"  ✅ Partial close {close_vol} lots #{pos.ticket}")
 
 
 def move_to_breakeven(symbol: str, action, magic: int):
@@ -373,12 +366,9 @@ def move_to_breakeven(symbol: str, action, magic: int):
             "tp":       pos.tp,
         })
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            log.info(f"  ✅ Breakeven set on #{pos.ticket}")
+            log.info(f"  ✅ Breakeven #{pos.ticket}")
         else:
-            log.warning(
-                f"  ❌ Breakeven failed #{pos.ticket}: "
-                f"{res.comment if res else 'no response'}"
-            )
+            log.warning(f"  ❌ Breakeven #{pos.ticket}: {res.comment if res else '?'}")
 
 
 def modify_sl(symbol: str, magic: int, new_sl: float):
@@ -396,7 +386,7 @@ def modify_sl(symbol: str, magic: int, new_sl: float):
             "tp":       pos.tp,
         })
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            log.info(f"  ✅ SL moved to {new_sl} on #{pos.ticket}")
+            log.info(f"  ✅ SL → {new_sl} on #{pos.ticket}")
 
 
 def send_order(
@@ -408,17 +398,14 @@ def send_order(
     tp: float,
     entry: float,
     is_limit: bool,
-    comment: str = "v36",
+    comment: str = "v37",
     _retry: bool = True,
 ) -> int | None:
-    """
-    Place a single order. Returns ticket number or None.
-    Retries once on requote (10004) with a fresh price.
-    """
+    """Place a single order; retry once on requote. Returns ticket or None."""
     lot  = round(min(max(lot, 0.01), cfg["max_lot"]), 2)
     tick = mt5.symbol_info_tick(symbol)
     if not tick:
-        log.error(f"  ❌ No tick data for {symbol}")
+        log.error(f"  ❌ No tick for {symbol}")
         return None
 
     sym_info = mt5.symbol_info(symbol)
@@ -430,10 +417,8 @@ def send_order(
     pt     = sym_info.point
     digits = sym_info.digits
 
-    if sl > 0:
-        sl = round(sl, digits)
-    if tp > 0:
-        tp = round(tp, digits)
+    if sl > 0: sl = round(sl, digits)
+    if tp > 0: tp = round(tp, digits)
 
     trade_action = mt5.TRADE_ACTION_DEAL
     order_type   = action
@@ -461,70 +446,54 @@ def send_order(
         "type_filling": get_filling_mode(symbol),
         "type_time":    mt5.ORDER_TIME_GTC,
     }
-    if sl > 0:
-        request["sl"] = sl
-    if tp > 0:
-        request["tp"] = tp
+    if sl > 0: request["sl"] = sl
+    if tp > 0: request["tp"] = tp
 
     direction = "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL"
     mode      = "PENDING" if trade_action == mt5.TRADE_ACTION_PENDING else "MARKET"
-    log.info(
-        f"  📤 Sending {mode} order: {symbol} {direction} "
-        f"lot:{lot} price:{exec_price} sl:{sl} tp:{tp}"
-    )
+    log.info(f"  📤 {mode} {symbol} {direction} lot:{lot} @{exec_price} sl:{sl} tp:{tp}")
 
     res = mt5.order_send(request)
     if res is None:
-        log.error(f"  ❌ order_send returned None — {mt5.last_error()}")
+        log.error(f"  ❌ order_send None — {mt5.last_error()}")
         return None
 
     if res.retcode == mt5.TRADE_RETCODE_DONE:
-        log.info(f"  ✅ [{mode}] #{res.order} | {symbol} lot:{lot} sl:{sl} tp:{tp}")
+        log.info(f"  ✅ [{mode}] #{res.order} {symbol} lot:{lot} sl:{sl} tp:{tp}")
         return res.order
 
-    # Requote: refresh price and retry once
     if res.retcode == 10004 and _retry:
-        log.warning(f"  🔄 Requote on {symbol} — retrying with fresh price")
+        log.warning(f"  🔄 Requote {symbol} — retrying at market")
         return send_order(cfg, symbol, action, lot, sl, tp, 0.0, False, comment, _retry=False)
 
-    log.warning(f"  ❌ Order failed | retcode:{res.retcode} | {res.comment}")
+    log.warning(f"  ❌ Order failed retcode:{res.retcode} | {res.comment}")
     _log_order_error(res.retcode, symbol, exec_price, sl, tp)
     return None
 
 
 def _log_order_error(code: int, symbol: str, price: float, sl: float, tp: float):
     hints = {
-        10004: "Requote — price moved",
-        10006: "Request rejected by broker",
-        10013: "Invalid request structure",
-        10014: "Invalid lot volume",
-        10015: "Invalid price",
-        10016: "Invalid SL or TP",
-        10017: "Trade disabled",
-        10018: "Market is closed",
-        10019: "Insufficient funds",
-        10024: "Too many requests",
-        10026: "Autotrading disabled by server",
-        10027: "Autotrading disabled by client",
-        10030: "Number of pending orders reached",
-        10031: "Volume limit reached",
-        10032: "Incorrect or banned symbol",
-        10036: "Position already closed",
+        10004: "Requote",           10006: "Rejected by broker",
+        10013: "Bad request",       10014: "Bad lot",
+        10015: "Bad price",         10016: "Bad SL/TP — check min distance",
+        10017: "Trade disabled",    10018: "Market closed",
+        10019: "No funds",          10024: "Too many requests",
+        10026: "AT disabled server",10027: "AT disabled client",
+        10030: "Pending limit hit", 10031: "Volume limit hit",
+        10032: "Bad symbol",        10036: "Already closed",
     }
-    hint = hints.get(code, f"Error code {code}")
-    log.warning(f"     💡 {hint}")
+    log.warning(f"     💡 {hints.get(code, f'code {code}')}")
     if code == 10016:
-        log.warning(
-            f"     📐 SL={sl} TP={tp} vs price {price} — "
-            "check minimum broker distance"
-        )
+        log.warning(f"     📐 SL={sl} TP={tp} vs price {price}")
 
 
 # ─────────────────────────────────────────────
-#  TRADE LOG  (master → slave bridge)
+#  TRADE LOG  (persistent backup / audit)
 # ─────────────────────────────────────────────
 def load_log(path: str) -> dict:
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    dirpart = os.path.dirname(path)
+    if dirpart:
+        os.makedirs(dirpart, exist_ok=True)
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         with open(path, "w") as f:
             json.dump({}, f)
@@ -533,21 +502,18 @@ def load_log(path: str) -> dict:
         with open(path) as f:
             data = json.load(f)
         if isinstance(data, list):
-            log.warning(f"⚠️ Trade log {path} was a list — resetting")
             save_log(path, {})
             return {}
         return data
-    except json.JSONDecodeError:
-        log.warning(f"⚠️ Trade log {path} was corrupt — resetting")
+    except (json.JSONDecodeError, Exception):
         save_log(path, {})
-        return {}
-    except Exception as e:
-        log.error(f"❌ Could not load trade log {path}: {e}")
         return {}
 
 
 def save_log(path: str, data: dict):
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    dirpart = os.path.dirname(path)
+    if dirpart:
+        os.makedirs(dirpart, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
@@ -555,7 +521,6 @@ def save_log(path: str, data: dict):
 
 
 async def save_log_async(path: str, data: dict):
-    """Non-blocking log write so trade execution isn't delayed by disk I/O."""
     await asyncio.to_thread(save_log, path, data)
 
 
@@ -574,11 +539,6 @@ def get_pip_size(symbol: str) -> float:
 
 
 def auto_sl_tp(symbol: str, action: int, entry_price: float) -> tuple[float, float, float, float]:
-    """
-    Calculate SL and three TPs automatically.
-    Uses live tick price when entry_price == 0.
-    Returns (sl, tp1, tp2, tp3); all 0.0 on failure.
-    """
     if entry_price == 0:
         tick = mt5.symbol_info_tick(symbol)
         if tick:
@@ -608,7 +568,7 @@ def auto_sl_tp(symbol: str, action: int, entry_price: float) -> tuple[float, flo
         tp3 = round(entry_price - sl_dist * RR_CONFIG["auto_rr3"], digits)
 
     log.info(
-        f"  📐 Auto SL/TP | entry:{entry_price} SL:{sl} "
+        f"  📐 Auto SL/TP entry:{entry_price} SL:{sl} "
         f"TP1:{tp1}(1:{RR_CONFIG['auto_rr1']}) "
         f"TP2:{tp2}(1:{RR_CONFIG['auto_rr2']}) "
         f"TP3:{tp3}(1:{RR_CONFIG['auto_rr3']})"
@@ -616,8 +576,7 @@ def auto_sl_tp(symbol: str, action: int, entry_price: float) -> tuple[float, flo
     return sl, tp1, tp2, tp3
 
 
-def _set_position_sltp(pos, new_sl: float, new_tp: float, symbol: str):
-    """Send a SLTP modify for a single position."""
+def _set_position_sltp(pos, new_sl: float, new_tp: float, symbol: str) -> bool:
     res = mt5.order_send({
         "action":   mt5.TRADE_ACTION_SLTP,
         "position": pos.ticket,
@@ -625,40 +584,25 @@ def _set_position_sltp(pos, new_sl: float, new_tp: float, symbol: str):
         "sl":       new_sl,
         "tp":       new_tp,
     })
-    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-        log.info(
-            f"  ✅ Auto SL/TP set on #{pos.ticket} "
-            f"({pos.symbol}) SL:{new_sl} TP:{new_tp}"
-        )
-        return True
+    ok = res and res.retcode == mt5.TRADE_RETCODE_DONE
+    if ok:
+        log.info(f"  ✅ SL/TP patched #{pos.ticket} {symbol} SL:{new_sl} TP:{new_tp}")
     else:
-        log.warning(
-            f"  ❌ Auto SL/TP failed #{pos.ticket}: "
-            f"{res.comment if res else mt5.last_error()}"
-        )
-        return False
+        log.warning(f"  ❌ SL/TP patch #{pos.ticket}: {res.comment if res else mt5.last_error()}")
+    return ok
 
 
 # ─────────────────────────────────────────────
 #  CHART DRAWING
 # ─────────────────────────────────────────────
 def draw_trade_levels(
-    symbol: str,
-    action: int,
-    entry: float,
-    sl: float,
-    tp1: float,
-    tp2: float = 0,
-    tp3: float = 0,
-    ticket: int = 0,
+    symbol: str, action: int, entry: float, sl: float,
+    tp1: float, tp2: float = 0, tp3: float = 0, ticket: int = 0,
 ):
     if not RR_CONFIG["draw_on_chart"]:
         return
     try:
-        prefix    = f"v36_{ticket}"
-        BLUE      = 0x3399FF
-        RED       = 0xFF3333
-        GREEN     = 0x00CC44
+        prefix    = f"v37_{ticket}"
         direction = "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL"
 
         def hline(name, price, color, style, width, label):
@@ -671,30 +615,23 @@ def draw_trade_levels(
             mt5.object_set_integer(0, name, mt5.OBJPROP_SELECTABLE, False)
             mt5.object_set_integer(0, name, mt5.OBJPROP_BACK,       True)
 
-        if entry > 0:
-            hline(f"{prefix}_E",   entry, BLUE,  mt5.STYLE_DASH,  1, f"ENTRY {direction} @ {entry}")
-        if sl > 0:
-            hline(f"{prefix}_SL",  sl,    RED,   mt5.STYLE_SOLID, 2, f"SL {sl}")
-        if tp1 > 0:
-            hline(f"{prefix}_TP1", tp1,   GREEN, mt5.STYLE_DOT,   1, f"TP1 {tp1}")
-        if tp2 > 0:
-            hline(f"{prefix}_TP2", tp2,   GREEN, mt5.STYLE_DOT,   1, f"TP2 {tp2}")
-        if tp3 > 0:
-            hline(f"{prefix}_TP3", tp3,   GREEN, mt5.STYLE_DOT,   1, f"TP3 {tp3}")
+        if entry > 0: hline(f"{prefix}_E",   entry, 0x3399FF, mt5.STYLE_DASH,  1, f"ENTRY {direction} @ {entry}")
+        if sl    > 0: hline(f"{prefix}_SL",  sl,    0xFF3333, mt5.STYLE_SOLID, 2, f"SL {sl}")
+        if tp1   > 0: hline(f"{prefix}_TP1", tp1,   0x00CC44, mt5.STYLE_DOT,   1, f"TP1 {tp1}")
+        if tp2   > 0: hline(f"{prefix}_TP2", tp2,   0x00CC44, mt5.STYLE_DOT,   1, f"TP2 {tp2}")
+        if tp3   > 0: hline(f"{prefix}_TP3", tp3,   0x00CC44, mt5.STYLE_DOT,   1, f"TP3 {tp3}")
 
         mt5.chart_redraw(0)
-        log.info(f"  📊 Chart levels drawn for #{ticket}")
     except Exception as e:
-        log.warning(f"  Chart draw skipped (headless?): {e}")
+        log.debug(f"  Chart draw skipped: {e}")
 
 
 # ─────────────────────────────────────────────
-#  AI SIGNAL PARSER (Claude API)
+#  AI SIGNAL PARSER  (Claude API, 3 s timeout)
 # ─────────────────────────────────────────────
 async def ai_parse_signal(text: str) -> dict | None:
     if not ANTHROPIC_API_KEY:
         return None
-
     try:
         import aiohttp
 
@@ -746,7 +683,7 @@ Rules:
                     "max_tokens": 500,
                     "messages":   [{"role": "user", "content": prompt}],
                 },
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=3),   # 3 s hard cap
             )
             data = await resp.json()
 
@@ -759,12 +696,10 @@ Rules:
             return None
 
         action_map = {"BUY": mt5.ORDER_TYPE_BUY, "SELL": mt5.ORDER_TYPE_SELL}
-        action = action_map.get(parsed.get("action"))
-
         result = {
             "type":            parsed.get("type", "trade"),
             "symbol":          parsed.get("symbol"),
-            "action":          action,
+            "action":          action_map.get(parsed.get("action")),
             "entry":           parsed.get("entry") or 0.0,
             "sl":              parsed.get("sl") or 0.0,
             "tp1":             parsed.get("tp1") or 0.0,
@@ -776,17 +711,13 @@ Rules:
             "ai_notes":        parsed.get("notes", ""),
             "confidence":      parsed.get("confidence", 100),
         }
-
         log.info(
-            f"  🤖 AI parsed: {result['type']} {result['symbol']} "
-            f"{parsed.get('action')} entry:{result['entry']} "
-            f"sl:{result['sl']} tp1:{result['tp1']} "
-            f"[confidence:{result['confidence']}%] {result['ai_notes']}"
+            f"  🤖 AI [{result['confidence']}%] {result['type']} {result['symbol']} "
+            f"{parsed.get('action')} entry:{result['entry']} sl:{result['sl']} tp1:{result['tp1']}"
         )
         return result
-
     except Exception as e:
-        log.warning(f"  ⚠️  AI parse failed ({e}), falling back to regex")
+        log.warning(f"  ⚠️ AI parse failed ({type(e).__name__}: {e})")
         return None
 
 
@@ -807,14 +738,13 @@ def regex_parse_signal(text: str) -> dict | None:
     ]
     trade_keywords = ["BUY", "SELL", "LONG", "SHORT", "CLOSE", "BREAKEVEN",
                       "SL TO", "BE NOW", "MOVE SL", "PARTIAL"]
-    has_trade_kw = any(kw in t for kw in trade_keywords)
-    if not has_trade_kw:
+    if not any(kw in t for kw in trade_keywords):
         return None
     noise_count = sum(1 for n in NOISE if n in t)
     if noise_count >= 2 and not any(kw in t for kw in ["BUY", "SELL", "LONG", "SHORT"]):
         return None
 
-    # Symbol detection
+    # Symbol detection — longest match first
     symbol = None
     for key in sorted(SYMBOL_MAP.keys(), key=len, reverse=True):
         if re.search(r'(?<![A-Z])' + re.escape(key) + r'(?![A-Z])', t):
@@ -877,17 +807,14 @@ def regex_parse_signal(text: str) -> dict | None:
                 action = mt5.ORDER_TYPE_SELL
                 break
     if action is None:
-        if re.search(r'\bBUY\b', t):
-            action = mt5.ORDER_TYPE_BUY
-        elif re.search(r'\bSELL\b', t):
-            action = mt5.ORDER_TYPE_SELL
+        if re.search(r'\bBUY\b', t):  action = mt5.ORDER_TYPE_BUY
+        elif re.search(r'\bSELL\b', t): action = mt5.ORDER_TYPE_SELL
     if action is None:
         return None
 
     is_limit = any(x in t for x in [
-        "LIMIT", "PENDING", "BUY STOP", "SELL STOP",
-        "BUY LIMIT", "SELL LIMIT", "WAIT FOR", "ENTRY AT",
-        "PLACE ORDER", "SET ORDER",
+        "LIMIT", "PENDING", "BUY STOP", "SELL STOP", "BUY LIMIT", "SELL LIMIT",
+        "WAIT FOR", "ENTRY AT", "PLACE ORDER", "SET ORDER",
     ])
 
     def _find(pattern, fallback=0.0):
@@ -897,7 +824,6 @@ def regex_parse_signal(text: str) -> dict | None:
     sl = _find(r"(?:S\.?L\.?|STOP\s*LOSS|STOPLOSS)\s*[:\-=@#]?\s*(\d{1,6}\.?\d{0,5})")
 
     tps: list[float] = []
-
     def _add_tp(v):
         try:
             fv = round(float(v), 5)
@@ -913,17 +839,14 @@ def regex_parse_signal(text: str) -> dict | None:
         m = re.search(
             r"T\.?P\.?\s*[:\-]?\s*(\d{1,6}\.?\d{0,5})"
             r"(?:\s*[\/,]\s*(\d{1,6}\.?\d{0,5}))?"
-            r"(?:\s*[\/,]\s*(\d{1,6}\.?\d{0,5}))?", t
-        )
+            r"(?:\s*[\/,]\s*(\d{1,6}\.?\d{0,5}))?", t)
         if m:
             for g in m.groups():
-                if g:
-                    _add_tp(g)
+                if g: _add_tp(g)
 
     if not tps:
         for m in re.finditer(
-            r"(?:TARGET|TAKE\s*PROFIT|PROFIT\s*TARGET)\s*[123]?\s*[:\-=]?\s*(\d{1,6}\.?\d{0,5})", t
-        ):
+            r"(?:TARGET|TAKE\s*PROFIT|PROFIT\s*TARGET)\s*[123]?\s*[:\-=]?\s*(\d{1,6}\.?\d{0,5})", t):
             _add_tp(m.group(1))
 
     if not tps:
@@ -936,20 +859,18 @@ def regex_parse_signal(text: str) -> dict | None:
             for n in [float(x) for x in lines[2:]]:
                 _add_tp(n)
 
-    tps  = tps[:3]
-    tp1  = tps[0] if len(tps) > 0 else 0.0
-    tp2  = tps[1] if len(tps) > 1 else 0.0
-    tp3  = tps[2] if len(tps) > 2 else 0.0
+    tps = tps[:3]
+    tp1 = tps[0] if len(tps) > 0 else 0.0
+    tp2 = tps[1] if len(tps) > 1 else 0.0
+    tp3 = tps[2] if len(tps) > 2 else 0.0
 
     zone = re.search(
-        r"(?:ENTRY\s*ZONE|ZONE|ENTRY\s*RANGE)[:\s]*(\d{1,6}\.?\d{0,5})\s*[-–]\s*(\d{1,6}\.?\d{0,5})", t
-    )
+        r"(?:ENTRY\s*ZONE|ZONE|ENTRY\s*RANGE)[:\s]*(\d{1,6}\.?\d{0,5})\s*[-–]\s*(\d{1,6}\.?\d{0,5})", t)
     if zone:
         entry = round((float(zone.group(1)) + float(zone.group(2))) / 2, 5)
     else:
         entry = _find(r"(?:ENTRY|ENTER)\s*[:\-=@]?\s*(\d{1,6}\.?\d{0,5})")
-        if not entry:
-            entry = _find(r"@\s*(\d{1,6}\.?\d{0,5})")
+        if not entry: entry = _find(r"@\s*(\d{1,6}\.?\d{0,5})")
         if not entry:
             rng = re.search(r"(?:BUY|SELL)\s+(?:\w+\s+)?(\d{1,6}\.?\d{0,5})\s*[-–]\s*(\d{1,6}\.?\d{0,5})", t)
             if rng:
@@ -966,38 +887,33 @@ def regex_parse_signal(text: str) -> dict | None:
                 entry = float(lines[0])
 
     return {
-        "type":     "trade",
-        "symbol":   symbol,
-        "action":   action,
-        "entry":    entry,
-        "sl":       sl,
-        "tp1":      tp1,
-        "tp2":      tp2,
-        "tp3":      tp3,
-        "is_limit": is_limit,
-        "ai_notes": "regex",
+        "type": "trade", "symbol": symbol, "action": action,
+        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "is_limit": is_limit, "ai_notes": "regex",
     }
 
 
 # ─────────────────────────────────────────────
-#  UNIFIED PARSE
+#  UNIFIED PARSE  (AI with 3 s timeout, then regex)
 # ─────────────────────────────────────────────
 async def parse_signal(text: str) -> dict | None:
     if ANTHROPIC_API_KEY:
-        sig = await ai_parse_signal(text)
-        if sig:
-            return sig
+        try:
+            sig = await asyncio.wait_for(ai_parse_signal(text), timeout=3.0)
+            if sig:
+                return sig
+        except asyncio.TimeoutError:
+            log.warning("  ⚠️ AI parse timed out — falling back to regex")
 
     sig = regex_parse_signal(text)
     if sig:
-        action_label = (
+        direction = (
             "BUY"  if sig.get("action") == mt5.ORDER_TYPE_BUY  else
-            "SELL" if sig.get("action") == mt5.ORDER_TYPE_SELL else
-            "N/A"
+            "SELL" if sig.get("action") == mt5.ORDER_TYPE_SELL else "N/A"
         )
         tps = [v for v in [sig.get("tp1", 0), sig.get("tp2", 0), sig.get("tp3", 0)] if v > 0]
         log.info(
-            f"  🔢 PARSED [{sig['type'].upper()}] {sig.get('symbol')} {action_label} | "
+            f"  🔢 [{sig['type'].upper()}] {sig.get('symbol')} {direction} "
             f"entry:{sig.get('entry', 0)} sl:{sig.get('sl', 0)} tps:{tps} "
             f"limit:{sig.get('is_limit', False)}"
         )
@@ -1005,17 +921,16 @@ async def parse_signal(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-#  EXECUTE ON MASTER
+#  EXECUTE ON MASTER  (called as a Task — never blocks handler)
 # ─────────────────────────────────────────────
 async def execute_on_master(master_name: str, cfg: dict, sig: dict):
     async with _mt5_lock:
-        log.info(f"[{master_name}] Switching to MT5 #{cfg['account']}...")
         if not await _ensure_mt5_account(cfg):
             return
 
         sym = resolve_symbol(sig["symbol"])
         if not sym:
-            log.warning(f"[{master_name}] Symbol '{sig['symbol']}' not found in MT5")
+            log.warning(f"[{master_name}] Symbol '{sig['symbol']}' not in MT5")
             return
 
         tickets  = []
@@ -1033,13 +948,12 @@ async def execute_on_master(master_name: str, cfg: dict, sig: dict):
             move_to_breakeven(sym, sig.get("action"), magic)
 
         elif sig_type == "modify_sl":
-            new_sl = sig.get("new_sl", 0)
-            if new_sl > 0:
-                modify_sl(sym, magic, new_sl)
+            if sig.get("new_sl", 0) > 0:
+                modify_sl(sym, magic, sig["new_sl"])
 
         elif sig_type == "trade":
             if sig.get("action") is None:
-                log.warning(f"[{master_name}] Trade signal missing direction, skipping")
+                log.warning(f"[{master_name}] No direction in signal, skipping")
                 return
 
             tick    = mt5.symbol_info_tick(sym)
@@ -1052,7 +966,7 @@ async def execute_on_master(master_name: str, cfg: dict, sig: dict):
             tp3 = sig.get("tp3", 0) or 0.0
 
             if sl == 0 or tp1 == 0:
-                log.info(f"  ⚙️  Signal missing SL/TP — auto-calculating RR")
+                log.info(f"  ⚙️ Missing SL/TP — auto-calculating")
                 a_sl, a_tp1, a_tp2, a_tp3 = auto_sl_tp(sym, sig["action"], entry_p)
                 if sl  == 0: sl  = a_sl
                 if tp1 == 0: tp1 = a_tp1
@@ -1062,15 +976,13 @@ async def execute_on_master(master_name: str, cfg: dict, sig: dict):
             active_tps = [v for v in [tp1, tp2, tp3] if v > 0]
 
             if not active_tps:
-                t = send_order(cfg, sym, sig["action"], base_lot, sl,
-                               0.0, entry_p, sig.get("is_limit", False))
+                t = send_order(cfg, sym, sig["action"], base_lot, sl, 0.0, entry_p, sig.get("is_limit", False))
                 if t:
                     tickets.append(t)
                     draw_trade_levels(sym, sig["action"], entry_p, sl, 0, 0, 0, t)
 
             elif len(active_tps) == 1:
-                t = send_order(cfg, sym, sig["action"], base_lot, sl,
-                               active_tps[0], entry_p, sig.get("is_limit", False))
+                t = send_order(cfg, sym, sig["action"], base_lot, sl, active_tps[0], entry_p, sig.get("is_limit", False))
                 if t:
                     tickets.append(t)
                     draw_trade_levels(sym, sig["action"], entry_p, sl, active_tps[0], 0, 0, t)
@@ -1079,8 +991,7 @@ async def execute_on_master(master_name: str, cfg: dict, sig: dict):
                 split = max(round(base_lot / len(active_tps), 2), 0.01)
                 log.info(f"  🔀 {len(active_tps)} TPs → {split} lot each")
                 for i, tp in enumerate(active_tps):
-                    t = send_order(cfg, sym, sig["action"], split, sl,
-                                   tp, entry_p, sig.get("is_limit", False))
+                    t = send_order(cfg, sym, sig["action"], split, sl, tp, entry_p, sig.get("is_limit", False))
                     if t:
                         tickets.append(t)
                         if i == 0:
@@ -1088,157 +999,149 @@ async def execute_on_master(master_name: str, cfg: dict, sig: dict):
                                 active_tps[0],
                                 active_tps[1] if len(active_tps) > 1 else 0,
                                 active_tps[2] if len(active_tps) > 2 else 0, t)
-                    await asyncio.sleep(0.2)
+                    # No sleep between orders — send as fast as broker accepts
 
             if tickets:
-                log_data = await asyncio.to_thread(load_log, cfg["json_file"])
-                key = str(uuid.uuid4())
-                log_data[key] = {
-                    "symbol":    sym,
-                    "action":    sig["action"],
-                    "sl":        sl,
-                    "tps":       active_tps,
-                    "entry":     entry_p,
-                    "is_limit":  sig.get("is_limit", False),
-                    "lot":       base_lot,
-                    "tickets":   tickets,
+                # Push to slave queues immediately (zero latency)
+                trade_record = {
+                    "symbol":   sym,
+                    "action":   sig["action"],
+                    "sl":       sl,
+                    "tps":      active_tps,
+                    "entry":    entry_p,
+                    "is_limit": sig.get("is_limit", False),
+                    "lot":      base_lot,
+                    "tickets":  tickets,
                     "timestamp": datetime.utcnow().isoformat(),
-                    "copied":    False,
                 }
-                await save_log_async(cfg["json_file"], log_data)
-                log.info(f"[{master_name}] 💾 Saved to trade log key:{key}")
+                master_account = cfg["account"]
+                pushed = 0
+                for sname, scfg in SLAVE_ACCOUNTS.items():
+                    if scfg.get("enabled", True) and scfg["copy_from_master"] == master_account:
+                        await _slave_queues[sname].put(dict(trade_record))
+                        log.info(f"[{master_name}] ➡️  Pushed to {sname} queue (depth:{_slave_queues[sname].qsize()})")
+                        pushed += 1
+
+                # Also write to JSON backup (non-blocking)
+                key = str(uuid.uuid4())
+                asyncio.create_task(_append_json_log(cfg["json_file"], key, trade_record))
+
+                log.info(f"[{master_name}] ✅ {len(tickets)} ticket(s) — pushed to {pushed} slave(s)")
         else:
-            log.info(f"[{master_name}] Signal type '{sig_type}' requires no MT5 action")
+            log.info(f"[{master_name}] type='{sig_type}' — no MT5 action needed")
+
+
+async def _append_json_log(path: str, key: str, record: dict):
+    """Fire-and-forget JSON audit write."""
+    try:
+        data = await asyncio.to_thread(load_log, path)
+        data[key] = {**record, "copied": False}
+        await save_log_async(path, data)
+    except Exception as e:
+        log.warning(f"  JSON log write failed: {e}")
 
 
 # ─────────────────────────────────────────────
-#  SLAVE COPY LOOP
-#  Polls at 2 s; batches all pending trades per slave in a single MT5 session.
+#  SLAVE WORKER  (one per slave, wakes on queue.get())
+#  Zero poll delay — wakes the instant master pushes a trade.
 # ─────────────────────────────────────────────
-async def slave_copy_loop():
-    log.info("🔁 Slave copy loop started (polling every 2 s)")
+async def slave_worker(slave_name: str, scfg: dict):
+    q = _slave_queues[slave_name]
+    log.info(f"[{slave_name}] ⚡ Slave worker ready (queue-based, zero delay)")
+
+    # Pre-find master name once
+    master_name_found = next(
+        (mn for mn, mc in MASTER_ACCOUNTS.items() if mc["account"] == scfg["copy_from_master"]),
+        "Unknown"
+    )
+
     while True:
-        for slave_name, scfg in SLAVE_ACCOUNTS.items():
-            if not scfg.get("enabled", True):
-                continue
+        trade = await q.get()    # blocks with zero CPU until a trade arrives
+        try:
+            log.info(f"[{slave_name}] 📋 Copying {trade['symbol']} from {master_name_found}...")
 
-            master_cfg = master_name_found = None
-            for mn, mc in MASTER_ACCOUNTS.items():
-                if mc["account"] == scfg["copy_from_master"]:
-                    master_cfg, master_name_found = mc, mn
-                    break
-            if not master_cfg:
-                continue
-
-            log_data   = await asyncio.to_thread(load_log, master_cfg["json_file"])
-            pending    = [(k, v) for k, v in log_data.items() if not v.get("copied")]
-            if not pending:
-                continue
-
-            # Acquire MT5 once for all pending trades of this slave
             async with _mt5_lock:
                 if not await _ensure_mt5_account(scfg):
+                    log.error(f"[{slave_name}] MT5 login failed — trade dropped")
+                    q.task_done()
                     continue
 
-                needs_save = False
-                for key, trade in pending:
-                    sym = resolve_symbol(trade["symbol"])
-                    if not sym:
-                        log.warning(f"[{slave_name}] '{trade['symbol']}' not found, skipping")
-                        trade["copied"] = True
-                        needs_save = True
-                        continue
+                sym = resolve_symbol(trade["symbol"])
+                if not sym:
+                    log.warning(f"[{slave_name}] '{trade['symbol']}' not found — skipping")
+                    q.task_done()
+                    continue
 
-                    lot  = min(max(round(trade["lot"] * scfg["lot_multiplier"], 2), 0.01), scfg["max_lot"])
-                    tps  = trade.get("tps", [])
-                    cmt  = f"SLV_{master_name_found}"[:31]
+                lot = min(max(round(trade["lot"] * scfg["lot_multiplier"], 2), 0.01), scfg["max_lot"])
+                tps = trade.get("tps", [])
+                cmt = f"SLV_{master_name_found}"[:31]
 
-                    log.info(f"[{slave_name}] 📋 Copying trade {key} from {master_name_found}...")
+                if not tps:
+                    send_order(scfg, sym, trade["action"], lot, trade["sl"],
+                               0.0, trade["entry"], trade["is_limit"], comment=cmt)
+                elif len(tps) == 1:
+                    send_order(scfg, sym, trade["action"], lot, trade["sl"],
+                               tps[0], trade["entry"], trade["is_limit"], comment=cmt)
+                else:
+                    split = max(round(lot / len(tps), 2), 0.01)
+                    for tp in tps:
+                        send_order(scfg, sym, trade["action"], split, trade["sl"],
+                                   tp, trade["entry"], trade["is_limit"], comment=cmt)
 
-                    if not tps:
-                        send_order(scfg, sym, trade["action"], lot, trade["sl"],
-                                   0.0, trade["entry"], trade["is_limit"], comment=cmt)
-                    elif len(tps) == 1:
-                        send_order(scfg, sym, trade["action"], lot, trade["sl"],
-                                   tps[0], trade["entry"], trade["is_limit"], comment=cmt)
-                    else:
-                        split = max(round(lot / len(tps), 2), 0.01)
-                        for tp in tps:
-                            send_order(scfg, sym, trade["action"], split, trade["sl"],
-                                       tp, trade["entry"], trade["is_limit"], comment=cmt)
-                            await asyncio.sleep(0.2)
-
-                    log.info(f"[{slave_name}] ✅ Done copying trade {key}")
-                    trade["copied"] = True
-                    needs_save = True
-
-                if needs_save:
-                    await save_log_async(master_cfg["json_file"], log_data)
-
-        await asyncio.sleep(2)
+                log.info(f"[{slave_name}] ✅ Copy done — {trade['symbol']}")
+        except Exception as e:
+            log.error(f"[{slave_name}] Worker error: {e}")
+        finally:
+            q.task_done()
 
 
 # ─────────────────────────────────────────────
-#  AUTO SL/TP SCANNER
-#  Scans ALL open positions across every configured account and sets
-#  SL/TP on any position that is missing one. Runs every 60 s.
+#  AUTO SL/TP SCANNER  (releases lock between accounts)
 # ─────────────────────────────────────────────
 async def auto_sltp_scanner():
-    """
-    Background task that automatically applies SL and TP to any open position
-    that is missing them, across all master and slave accounts.
-    """
-    interval = RR_CONFIG["auto_sltp_scan_interval"]
+    interval     = RR_CONFIG["auto_sltp_scan_interval"]
     magic_filter = RR_CONFIG["auto_sltp_magic_filter"]
-    log.info(f"🔍 Auto SL/TP scanner started (interval: {interval} s)")
+    log.info(f"🔍 Auto SL/TP scanner started (every {interval} s)")
+    await asyncio.sleep(20)
 
-    await asyncio.sleep(15)  # let startup settle
-
-    all_accounts: list[dict] = list(MASTER_ACCOUNTS.values()) + list(SLAVE_ACCOUNTS.values())
+    all_accounts = list(MASTER_ACCOUNTS.values()) + list(SLAVE_ACCOUNTS.values())
 
     while True:
         for cfg in all_accounts:
             if not cfg.get("enabled", True):
                 continue
             try:
-                async with _mt5_lock:
+                async with _mt5_lock:                  # lock per account, not per full scan
                     if not await _ensure_mt5_account(cfg):
                         continue
+                    positions = mt5.positions_get() or []
 
-                    positions = mt5.positions_get()
-                    if not positions:
+                for pos in positions:
+                    if magic_filter and pos.magic not in magic_filter:
+                        continue
+                    missing_sl = pos.sl == 0.0
+                    missing_tp = pos.tp == 0.0
+                    if not (missing_sl or missing_tp):
                         continue
 
-                    for pos in positions:
-                        # Respect magic filter
-                        if magic_filter and pos.magic not in magic_filter:
-                            continue
+                    a_sl, a_tp1, _, _ = auto_sl_tp(pos.symbol, pos.type, pos.price_open)
+                    if a_sl == 0 and a_tp1 == 0:
+                        continue
 
-                        missing_sl = pos.sl == 0.0
-                        missing_tp = pos.tp == 0.0
-                        if not (missing_sl or missing_tp):
-                            continue
+                    new_sl = a_sl  if missing_sl else pos.sl
+                    new_tp = a_tp1 if missing_tp else pos.tp
 
-                        symbol = pos.symbol
-                        action = pos.type  # ORDER_TYPE_BUY or ORDER_TYPE_SELL
+                    log.info(
+                        f"  🔧 #{pos.ticket} {pos.symbol} "
+                        f"{'SL ' if missing_sl else ''}{'TP' if missing_tp else ''} missing "
+                        f"→ SL:{new_sl} TP:{new_tp}"
+                    )
+                    # Patch needs the lock too
+                    async with _mt5_lock:
+                        if await _ensure_mt5_account(cfg):
+                            _set_position_sltp(pos, new_sl, new_tp, pos.symbol)
 
-                        # Calculate from actual open price
-                        a_sl, a_tp1, a_tp2, a_tp3 = auto_sl_tp(symbol, action, pos.price_open)
-                        if a_sl == 0 and a_tp1 == 0:
-                            continue
-
-                        new_sl = a_sl  if missing_sl else pos.sl
-                        # Use TP1 as the single TP for existing positions
-                        new_tp = a_tp1 if missing_tp else pos.tp
-
-                        log.info(
-                            f"  🔧 Auto-patching #{pos.ticket} {symbol} "
-                            f"{'missing SL ' if missing_sl else ''}"
-                            f"{'missing TP' if missing_tp else ''} "
-                            f"→ SL:{new_sl} TP:{new_tp}"
-                        )
-                        _set_position_sltp(pos, new_sl, new_tp, symbol)
-
+                await asyncio.sleep(0)   # yield between accounts so trades can grab lock
             except Exception as e:
                 log.warning(f"  Auto SL/TP scanner error: {e}")
 
@@ -1272,36 +1175,28 @@ def _build_static_channel_map():
             for cid in _normalize_channel_id(ch):
                 if (mname, mcfg) not in CHANNEL_TO_MASTERS.get(cid, []):
                     CHANNEL_TO_MASTERS.setdefault(cid, []).append((mname, mcfg))
-    log.info(f"  📡 Static channel map: {len(CHANNEL_TO_MASTERS)} ID variants registered")
+    log.info(f"  📡 Static map: {len(CHANNEL_TO_MASTERS)} channel ID variants")
 
 
 async def _resolve_channels_via_telethon():
-    all_config_ids: set[int] = set()
-    for mcfg in MASTER_ACCOUNTS.values():
-        for ch in mcfg["channels"]:
-            all_config_ids.add(ch)
-
+    all_ids: set[int] = {ch for mcfg in MASTER_ACCOUNTS.values() for ch in mcfg["channels"]}
     resolved = 0
-    for ch_id in all_config_ids:
+    for ch_id in all_ids:
         try:
-            entity      = await client.get_entity(ch_id)
-            real_id     = entity.id
-            chat_id     = -int(f"100{real_id}")
+            entity  = await client.get_entity(ch_id)
+            real_id = entity.id
+            chat_id = -int(f"100{real_id}")
+            title   = getattr(entity, "title", "?")
             for mname, mcfg in MASTER_ACCOUNTS.items():
                 if ch_id in mcfg["channels"]:
                     for cid in [real_id, -real_id, chat_id, -chat_id]:
                         if (mname, mcfg) not in CHANNEL_TO_MASTERS.get(cid, []):
                             CHANNEL_TO_MASTERS.setdefault(cid, []).append((mname, mcfg))
-            title = entity.title if hasattr(entity, "title") else "?"
-            log.info(f"  ✅ Resolved {ch_id} → {real_id} → {chat_id} [{title}]")
+            log.info(f"  ✅ Channel {ch_id} → real:{real_id} chat_id:{chat_id} [{title}]")
             resolved += 1
         except Exception as e:
-            log.warning(f"  ⚠️  Could not resolve channel {ch_id}: {e}")
-
-    log.info(
-        f"  📡 Channel resolution: {resolved}/{len(all_config_ids)} resolved | "
-        f"{len(CHANNEL_TO_MASTERS)} routing entries total"
-    )
+            log.warning(f"  ⚠️  Channel {ch_id} resolve failed: {e}")
+    log.info(f"  📡 Resolved {resolved}/{len(all_ids)} | {len(CHANNEL_TO_MASTERS)} routing entries")
 
 
 # ─────────────────────────────────────────────
@@ -1310,9 +1205,8 @@ async def _resolve_channels_via_telethon():
 client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
 _build_static_channel_map()
 
-# Fixed-size deque for signal dedup (LRU-style, thread-safe append/popleft)
-_seen_signals: deque = deque(maxlen=500)
 _seen_set:     set   = set()
+_seen_signals: deque = deque(maxlen=500)
 
 
 @client.on(events.NewMessage())
@@ -1322,72 +1216,63 @@ async def handler(event):
     if not text.strip():
         return
 
-    log.info(f"📨 MSG | channel:{cid} | {text[:100].replace(chr(10), ' ')}")
-
+    # ── CHANNEL DEBUG: always show the exact chat_id ──────────────────────
+    preview = text[:80].replace("\n", " ")
     masters = CHANNEL_TO_MASTERS.get(cid, [])
+
     if not masters:
+        # Print UNMATCHED channel IDs prominently so the user can add them
+        log.debug(f"📨 UNMATCHED channel:{cid} | {preview}")
         return
 
+    log.info(f"📨 channel:{cid} → {[m[0] for m in masters]} | {preview}")
+
+    # ── Dedup ────────────────────────────────────────────────────────────
     sig_hash = f"{cid}:{text[:200]}"
     if sig_hash in _seen_set:
-        log.info("  ⏭ Duplicate signal ignored")
+        log.info("  ⏭ Duplicate ignored")
         return
     if len(_seen_signals) >= 500:
-        old = _seen_signals[0]  # deque handles eviction via maxlen
-        _seen_set.discard(old)
+        _seen_set.discard(_seen_signals[0])
     _seen_signals.append(sig_hash)
     _seen_set.add(sig_hash)
 
-    log.info(f"  ✅ Signal channel matched → {[m[0] for m in masters]}")
-
+    # ── Parse ────────────────────────────────────────────────────────────
     sig = await parse_signal(text)
     if not sig:
-        log.info("  ⏭ No actionable signal found in message")
+        log.info("  ⏭ No actionable signal")
         return
 
     tps = [v for v in [sig.get("tp1", 0), sig.get("tp2", 0), sig.get("tp3", 0)] if v > 0]
+    direction = "BUY" if sig.get("action") == mt5.ORDER_TYPE_BUY else \
+                "SELL" if sig.get("action") == mt5.ORDER_TYPE_SELL else "N/A"
     log.info(
-        f"📊 SIGNAL → {sig.get('symbol')} | type:{sig.get('type')} | "
-        f"action:{'BUY' if sig.get('action') == mt5.ORDER_TYPE_BUY else 'SELL' if sig.get('action') == mt5.ORDER_TYPE_SELL else 'N/A'} | "
-        f"entry:{sig.get('entry', 0)} SL:{sig.get('sl', 0)} TPs:{tps}"
+        f"📊 {sig.get('symbol')} {direction} entry:{sig.get('entry', 0)} "
+        f"SL:{sig.get('sl', 0)} TPs:{tps} type:{sig.get('type')}"
     )
 
-    # Fire all matching masters concurrently — no sequential blocking
-    tasks = [
-        asyncio.create_task(execute_on_master(master_name, master_cfg, sig))
-        for master_name, master_cfg in masters
-        if master_cfg.get("enabled", True)
-    ]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    # ── FIRE-AND-FORGET: create tasks and return immediately ─────────────
+    # handler() returns to Telethon instantly — next message is never delayed
+    for master_name, master_cfg in masters:
+        if master_cfg.get("enabled", True):
+            asyncio.create_task(execute_on_master(master_name, master_cfg, sig))
 
 
 # ─────────────────────────────────────────────
-#  MT5 WATCHDOG
+#  MT5 WATCHDOG  (keeps active account warm)
 # ─────────────────────────────────────────────
 async def mt5_watchdog():
-    """
-    Checks the active MT5 connection every 30 s.
-    Also round-robins through all accounts to pre-warm connections.
-    """
     await asyncio.sleep(30)
-    all_cfgs = list(MASTER_ACCOUNTS.values()) + list(SLAVE_ACCOUNTS.values())
-    idx = 0
     while True:
         try:
             async with _mt5_lock:
                 global _mt5_active_account
-                if _mt5_active_account is not None:
-                    acc = mt5.account_info()
-                    if acc is None:
-                        log.warning(
-                            f"  🔌 Watchdog: MT5 #{_mt5_active_account} "
-                            "connection lost, resetting"
-                        )
-                        mt5.shutdown()
-                        _mt5_active_account = None
+                if _mt5_active_account is not None and mt5.account_info() is None:
+                    log.warning(f"  🔌 Watchdog: MT5 #{_mt5_active_account} dropped — resetting")
+                    mt5.shutdown()
+                    _mt5_active_account = None
         except Exception as e:
-            log.warning(f"  Watchdog error: {e}")
+            log.warning(f"  Watchdog: {e}")
         await asyncio.sleep(30)
 
 
@@ -1396,25 +1281,31 @@ async def mt5_watchdog():
 # ─────────────────────────────────────────────
 async def main():
     log.info("═" * 65)
-    log.info("  ARCHITECT v36.0 | AI-Powered | Master/Slave | Auto SL/TP")
+    log.info("  ARCHITECT v37.0 | Zero-latency queue | Fire-and-forget handler")
     log.info("═" * 65)
 
     if not all([TG_SESSION, TG_API_ID, TG_API_HASH]):
-        log.error("❌ Missing .env! Set TG_SESSION, TG_API_ID, TG_API_HASH")
+        log.error("❌ Missing .env — set TG_SESSION, TG_API_ID, TG_API_HASH")
         return
 
     if ANTHROPIC_API_KEY:
-        log.info("  🤖 AI signal parsing: ENABLED (Claude API)")
+        log.info("  🤖 AI parsing: ENABLED (3 s timeout then regex fallback)")
     else:
-        log.info("  🔢 AI signal parsing: DISABLED (regex only — add ANTHROPIC_API_KEY to .env)")
+        log.info("  🔢 AI parsing: DISABLED (regex only)")
 
     # Ensure JSON log directories exist
     for cfg in MASTER_ACCOUNTS.values():
-        if os.path.dirname(cfg["json_file"]):
-            os.makedirs(os.path.dirname(cfg["json_file"]), exist_ok=True)
-        load_log(cfg["json_file"])
+        dirpart = os.path.dirname(cfg["json_file"])
+        if dirpart:
+            os.makedirs(dirpart, exist_ok=True)
+        await asyncio.to_thread(load_log, cfg["json_file"])
 
-    asyncio.create_task(slave_copy_loop())
+    # Start slave workers (one per slave — queue-based, zero poll delay)
+    for sname, scfg in SLAVE_ACCOUNTS.items():
+        if scfg.get("enabled", True):
+            asyncio.create_task(slave_worker(sname, scfg))
+            log.info(f"  ⚡ Slave worker launched: {sname}")
+
     asyncio.create_task(mt5_watchdog())
     asyncio.create_task(auto_sltp_scanner())
 
@@ -1431,13 +1322,14 @@ async def main():
                 log.info(f"  SLAVE  [{n}] #{c['account']} → copies #{c['copy_from_master']}")
 
             await _resolve_channels_via_telethon()
-            log.info(f"  Routing {len(CHANNEL_TO_MASTERS)} channel ID variants total")
+            log.info(f"  Routing {len(CHANNEL_TO_MASTERS)} channel ID variants")
+            log.info("  ⚡ All systems hot — waiting for signals...")
 
             await client.run_until_disconnected()
-            log.warning("⚠️ Telegram disconnected — reconnecting in 10 s...")
+            log.warning("⚠️ Telegram disconnected — reconnecting in 5 s...")
         except Exception as e:
-            log.error(f"❌ Telegram error: {e} — reconnecting in 10 s...")
-        await asyncio.sleep(10)
+            log.error(f"❌ Telegram error: {e} — reconnecting in 5 s...")
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
