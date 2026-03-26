@@ -20,7 +20,9 @@ import logging
 import json
 import time
 import ssl
+import socket
 import threading
+import sys
 
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -30,6 +32,26 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
+
+# ── SINGLE-INSTANCE LOCK ──────────────────────────────────────────────────────
+# Bind a TCP socket on localhost so a second launch fails immediately instead
+# of fighting the first process for Telegram's getUpdates slot.
+_LOCK_PORT = 47832
+_lock_socket = None
+
+def _acquire_instance_lock():
+    global _lock_socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        s.bind(("127.0.0.1", _LOCK_PORT))
+    except OSError:
+        print(
+            f"[FATAL] Another instance of this bot is already running "
+            f"(port {_LOCK_PORT} is taken). Kill the old process first."
+        )
+        sys.exit(1)
+    _lock_socket = s  # keep reference so the socket stays bound
 
 # ── ANALYTICS DB ──────────────────────────────────────────────────────────────
 TRADES_FILE = os.environ.get(
@@ -873,6 +895,9 @@ async def on_magic_trader(event):
 async def main():
     global alert_bot
 
+    # Enforce single instance — exits immediately if another copy is running.
+    _acquire_instance_lock()
+
     log.info("=" * 55)
     log.info("  MAGIC TRADER → IQ OPTION BOT v1.0")
     log.info(f"  Risk: {RISK_PERCENT}% | Gales: {MAX_GALES} | Countdown: {COUNTDOWN_SECS}s")
@@ -893,10 +918,8 @@ async def main():
 
     threading.Thread(target=iq_keepalive, daemon=True).start()
 
-    # Build the PTB Application first; reuse its internal bot as alert_bot.
-    # Creating a separate Bot() instance with the same token would cause a
-    # Telegram 409 Conflict because both would open competing getUpdates
-    # long-poll connections.
+    # Build the Application first; reuse its internal bot as alert_bot so
+    # there is only ever one HTTP connection for this token.
     ptb_app = Application.builder().token(ALERT_BOT_TOKEN).build()
     ptb_app.add_handler(CommandHandler("status",  cmd_status))
     ptb_app.add_handler(CommandHandler("balance", cmd_balance))
@@ -911,12 +934,22 @@ async def main():
     ptb_app.add_handler(CallbackQueryHandler(button_callback))
 
     async with ptb_app:
-        # ptb_app.__aenter__ calls initialize(), which sets up the HTTP client.
-        # Point alert_bot at the same Bot object — no second connection.
         alert_bot = ptb_app.bot
 
         me = await alert_bot.get_me()
         log.info(f"Alert bot: @{me.username}")
+
+        # Delete any active webhook AND drop the previous getUpdates session.
+        # This is the only reliable way to clear a stale connection left by a
+        # previous run that was killed without a clean shutdown. Without this,
+        # Telegram keeps the old long-poll alive for up to ~60 s, causing 409s.
+        log.info("Clearing any existing webhook / getUpdates session...")
+        try:
+            await alert_bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning(f"delete_webhook: {e}")
+        # Give Telegram's servers time to tear down the old session.
+        await asyncio.sleep(3)
 
         await alert_bot.send_message(
             chat_id=ALERT_CHAT_ID,
