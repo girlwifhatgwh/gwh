@@ -121,61 +121,75 @@ trade_log: dict[str, dict[str, Any]] = {}
 # Asset map (Magic Trader -> IQ Option)
 # -----------------------------------------------------------------------------
 ASSET_MAP = {
-    # Forex OTC (demo & weekends)
+    # Major/minor Forex OTC
     "EUR/AUD": "EURAUD-OTC",
     "EUR/USD": "EURUSD-OTC",
     "EUR/GBP": "EURGBP-OTC",
     "EUR/JPY": "EURJPY-OTC",
     "EUR/CHF": "EURCHF-OTC",
     "EUR/CAD": "EURCAD-OTC",
+    "EUR/NZD": "EURNZD-OTC",
     "GBP/USD": "GBPUSD-OTC",
     "GBP/JPY": "GBPJPY-OTC",
     "GBP/CHF": "GBPCHF-OTC",
     "GBP/AUD": "GBPAUD-OTC",
     "GBP/CAD": "GBPCAD-OTC",
+    "GBP/NZD": "GBPNZD-OTC",
     "USD/JPY": "USDJPY-OTC",
     "USD/CHF": "USDCHF-OTC",
     "USD/CAD": "USDCAD-OTC",
+    "USD/MXN": "USDMXN-OTC",
+    "USD/TRY": "USDTRY-OTC",
     "AUD/USD": "AUDUSD-OTC",
     "AUD/JPY": "AUDJPY-OTC",
+    "AUD/CHF": "AUDCHF-OTC",
     "NZD/USD": "NZDUSD-OTC",
     "USD/BRL": "USDBRL-OTC",
     "NZD/JPY": "NZDJPY-OTC",
+    "NZD/CAD": "NZDCAD-OTC",
     "CAD/JPY": "CADJPY-OTC",
+    "CAD/CHF": "CADCHF-OTC",
+    "CHF/JPY": "CHFJPY-OTC",
     "AUD/CAD": "AUDCAD-OTC",
     "AUD/NZD": "AUDNZD-OTC",
     "XAUUSD": "XAUUSD-OTC",
+    "XAGUSD": "XAGUSD-OTC",
     "GOLD": "XAUUSD-OTC",
+    "SILVER": "XAGUSD-OTC",
     "XAU/USD": "XAUUSD-OTC",
+    "XAG/USD": "XAGUSD-OTC",
 }
 
-LIVE_ASSET_MAP = {
-    "EUR/AUD": "EURAUD",
-    "EUR/USD": "EURUSD",
-    "EUR/GBP": "EURGBP",
-    "EUR/JPY": "EURJPY",
-    "EUR/CHF": "EURCHF",
-    "EUR/CAD": "EURCAD",
-    "GBP/USD": "GBPUSD",
-    "GBP/JPY": "GBPJPY",
-    "GBP/CHF": "GBPCHF",
-    "GBP/AUD": "GBPAUD",
-    "GBP/CAD": "GBPCAD",
-    "USD/JPY": "USDJPY",
-    "USD/CHF": "USDCHF",
-    "USD/CAD": "USDCAD",
-    "AUD/USD": "AUDUSD",
-    "AUD/JPY": "AUDJPY",
-    "NZD/USD": "NZDUSD",
-    "USD/BRL": "USDBRL",
-    "NZD/JPY": "NZDJPY",
-    "CAD/JPY": "CADJPY",
-    "AUD/CAD": "AUDCAD",
-    "AUD/NZD": "AUDNZD",
-    "XAUUSD": "XAUUSD",
-    "GOLD": "XAUUSD",
-    "XAU/USD": "XAUUSD",
-}
+LIVE_ASSET_MAP = {asset: symbol.replace("-OTC", "") for asset, symbol in ASSET_MAP.items()}
+
+ASSET_ALIASES: dict[str, str] = {}
+
+
+def _register_asset_alias(alias: str, canonical_asset: str) -> None:
+    if alias:
+        ASSET_ALIASES[alias.upper()] = canonical_asset
+
+
+for canonical in ASSET_MAP:
+    _register_asset_alias(canonical, canonical)
+    _register_asset_alias(f"{canonical} (OTC)", canonical)
+    compact = canonical.replace("/", "")
+    _register_asset_alias(compact, canonical)
+    _register_asset_alias(f"{compact}-OTC", canonical)
+
+# Extra naming styles seen in signal channels.
+_register_asset_alias("GOLD (OTC)", "GOLD")
+_register_asset_alias("SILVER (OTC)", "SILVER")
+_register_asset_alias("XAUUSD (OTC)", "XAUUSD")
+_register_asset_alias("XAGUSD (OTC)", "XAGUSD")
+
+
+def _find_asset_key(text: str) -> str | None:
+    upper = text.upper()
+    for alias in sorted(ASSET_ALIASES, key=len, reverse=True):
+        if alias in upper:
+            return ASSET_ALIASES[alias]
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -388,6 +402,15 @@ def _build_symbol_candidates(asset: str) -> list[str]:
     return candidates
 
 
+def _symbol_case_variants(symbol: str) -> list[str]:
+    """Return case/fallback variants for iq_api.buy symbol argument."""
+    variants: list[str] = []
+    for candidate in (symbol, symbol.upper(), symbol.lower()):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
 def _resolve_open_symbol_variants() -> dict[str, str]:
     """
     Map normalized symbols to open symbols returned by IQ Option.
@@ -521,22 +544,29 @@ def iq_place_trade(asset: str, direction: str, amount: float, expiry_min: int) -
                 prioritized.append(symbol)
 
         last_reason = None
+        attempted: list[str] = []
         for iq_asset in prioritized:
-            log.info(f"Placing: {iq_asset} {action} ${amount} {expiry_min}min [{mode()}]")
-            check, order_id = iq_api.buy(amount, iq_asset, action, expiry_min)
-            if check:
-                log.info(f"TRADE PLACED! Symbol: {iq_asset} | Order: {order_id}")
-                time.sleep(1)
-                bal = iq_api.get_balance()
-                if bal is not None:
-                    account_balance = float(bal)
-                return True
+            for buy_symbol in _symbol_case_variants(iq_asset):
+                if buy_symbol in attempted:
+                    continue
+                attempted.append(buy_symbol)
+                log.info(
+                    f"Placing: {buy_symbol} {action} ${amount} {expiry_min}min [{mode()}]"
+                )
+                check, order_id = iq_api.buy(amount, buy_symbol, action, expiry_min)
+                if check:
+                    log.info(f"TRADE PLACED! Symbol: {buy_symbol} | Order: {order_id}")
+                    time.sleep(1)
+                    bal = iq_api.get_balance()
+                    if bal is not None:
+                        account_balance = float(bal)
+                    return True
 
-            last_reason = order_id
-            log.warning(f"Trade attempt failed for {iq_asset}: {order_id}")
+                last_reason = order_id
+                log.warning(f"Trade attempt failed for {buy_symbol}: {order_id}")
 
         log.error(
-            f"Trade failed for asset {asset} after {len(prioritized)} symbol attempts. "
+            f"Trade failed for asset {asset} after {len(attempted)} symbol attempts. "
             f"Last reason: {last_reason}"
         )
         return False
@@ -595,11 +625,7 @@ def parse_result(text: str) -> dict[str, Any] | None:
     elif "2ND GALE" in upper or "2 GALE" in upper or "GALE 2" in upper:
         gale_num = 2
 
-    asset_found = None
-    for key in sorted(ASSET_MAP.keys(), key=len, reverse=True):
-        if key.upper() in upper:
-            asset_found = key
-            break
+    asset_found = _find_asset_key(t)
     if not asset_found:
         return None
 
@@ -630,11 +656,7 @@ def parse_magic_trader(text: str) -> dict[str, Any] | None:
         return None
     expiry_min = int(exp.group(1))
 
-    asset_key = None
-    for key in sorted(ASSET_MAP, key=len, reverse=True):
-        if key.upper() in t.upper():
-            asset_key = key
-            break
+    asset_key = _find_asset_key(t)
     if not asset_key:
         return None
 
