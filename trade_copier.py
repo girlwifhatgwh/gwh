@@ -1060,6 +1060,9 @@ def regex_parse_signal(text: str) -> dict | None:
         "CONGRATULATIONS", "THANK YOU", "GOOD MORNING", "GOOD EVENING",
         "JOIN", "VIP CHANNEL", "PERFORMANCE", "SUBSCRIBE",
         "BREAKING:", "OIL PRICES SURGED",
+        # Individual stocks — not MT5 forex symbols, skip them
+        "TESLA", "APPLE", "AAPL", "AMAZON", "GOOGLE", "META", "NVIDIA",
+        "MICROSOFT", "NETFLIX", "TSLA", "AMZN", "MSFT", "NFLX",
     ]
     trade_kws = ["BUY", "SELL", "LONG", "SHORT", "CLOSE", "BREAKEVEN",
                  "SL TO", "BE NOW", "MOVE SL", "PARTIAL"]
@@ -1115,18 +1118,28 @@ def regex_parse_signal(text: str) -> dict | None:
     force_mkt = any(re.search(p, t) for p in MKT)
     force_pnd = not force_mkt and any(re.search(p, t) for p in PND)
 
-    # Direction
+    # Direction — check explicit SELL phrases FIRST (highest priority).
+    # "⭕Sell!" signals and "Short!" descriptions must be caught before the
+    # generic BUY/SELL word scan, otherwise "Bullish Breakout ⭕Sell!" picks
+    # up "Bullish" and wrongly fires as BUY.
     action = None
-    for w in ["BUY STOP","BUY LIMIT","BUY NOW","BUY @","BUY MARKET",
-              "GO BUY","GO LONG","LONG NOW","BULLISH","📈","🟢","⬆","↑","LONG"]:
-        if w in t: action = BUY; break
+    SELL_FIRST = ["SELL STOP","SELL LIMIT","SELL NOW","SELL @","SELL MARKET",
+                  "GO SELL","GO SHORT","SHORT NOW","BEARISH",
+                  "⭕SELL","⭕SHORT","LOCAL SHORT","PULLBACK AHEAD",
+                  "📉","🔴","⬇","↓","SHORT"]
+    BUY_FIRST  = ["BUY STOP","BUY LIMIT","BUY NOW","BUY @","BUY MARKET",
+                  "GO BUY","GO LONG","LONG NOW","BULLISH BREAKOUT",
+                  "⭕BUY","⭕LONG","LOCAL LONG",
+                  "📈","🟢","⬆","↑","LONG"]
+    for w in SELL_FIRST:
+        if w in t: action = SELL; break
     if action is None:
-        for w in ["SELL STOP","SELL LIMIT","SELL NOW","SELL @","SELL MARKET",
-                  "GO SELL","GO SHORT","SHORT NOW","BEARISH","📉","🔴","⬇","↓","SHORT"]:
-            if w in t: action = SELL; break
+        for w in BUY_FIRST:
+            if w in t: action = BUY; break
     if action is None:
-        if re.search(r'\bBUY\b', t):   action = BUY
-        elif re.search(r'\bSELL\b', t): action = SELL
+        # Generic word scan — SELL before BUY to avoid false positives
+        if re.search(r'\bSELL\b', t):  action = SELL
+        elif re.search(r'\bBUY\b', t): action = BUY
     if action is None:
         return None
 
