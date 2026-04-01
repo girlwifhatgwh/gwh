@@ -259,30 +259,33 @@ def _worker_main(cfg: dict, cmd_queue: mp.Queue, result_queue: mp.Queue,
 
     # ── STEP 1: Connect to MT5 once ──────────────────────────────────────
     def _connect() -> bool:
-        # Try attaching to an already-running terminal first (faster)
+        # ALWAYS use the dedicated terminal path for this account.
+        # Never call mt5.initialize() without path — that would attach to
+        # any already-running terminal on the machine and potentially log
+        # another account's credentials into it, kicking that account out.
+        wlog.info(f"[{account_name}] Connecting to dedicated terminal: {cfg['mt5_path']}")
         ok = mt5.initialize(
+            path=cfg["mt5_path"],
             login=cfg["account"],
             password=cfg["password"],
             server=cfg["server"],
-            timeout=10000,
+            timeout=30000,
         )
-        if not ok:
-            wlog.info(f"[{account_name}] Launching terminal from {cfg['mt5_path']}...")
-            ok = mt5.initialize(
-                path=cfg["mt5_path"],
-                login=cfg["account"],
-                password=cfg["password"],
-                server=cfg["server"],
-                timeout=25000,
-            )
         if ok:
             acc = mt5.account_info()
-            if acc:
+            if acc and acc.login == cfg["account"]:
                 wlog.info(
                     f"[{account_name}] ✅ MT5 connected #{acc.login} | "
                     f"{acc.server} | Balance:{acc.balance:.2f} {acc.currency}"
                 )
                 return True
+            # Connected but wrong account — shut down and refuse
+            wlog.error(
+                f"[{account_name}] ❌ Wrong account connected "
+                f"(got #{acc.login if acc else '?'}, expected #{cfg['account']}) — shutting down"
+            )
+            mt5.shutdown()
+            return False
         wlog.error(f"[{account_name}] ❌ MT5 connect failed: {mt5.last_error()}")
         return False
 
@@ -577,9 +580,17 @@ def _worker_main(cfg: dict, cmd_queue: mp.Queue, result_queue: mp.Queue,
         # ── Periodic background scans ──────────────────────────────────
         now = time.monotonic()
         if now - last_sltp_scan > sltp_interval:
-            # Verify connection is still alive first
-            if mt5.account_info() is None:
-                wlog.warning(f"[{account_name}] Connection lost — reconnecting...")
+            # Verify connection is still alive AND is the correct account
+            acc_check = mt5.account_info()
+            if acc_check is None or acc_check.login != cfg["account"]:
+                if acc_check and acc_check.login != cfg["account"]:
+                    wlog.warning(
+                        f"[{account_name}] ⚠️ Wrong account #{acc_check.login} active "
+                        f"(expected #{cfg['account']}) — reconnecting to dedicated terminal"
+                    )
+                    mt5.shutdown()
+                else:
+                    wlog.warning(f"[{account_name}] Connection lost — reconnecting to dedicated terminal...")
                 if not _connect():
                     time.sleep(5)
                     continue
@@ -606,8 +617,16 @@ def _worker_main(cfg: dict, cmd_queue: mp.Queue, result_queue: mp.Queue,
             ctype = cmd.get("type")
 
             # ── Reconnect healthcheck ──────────────────────────────────
-            if mt5.account_info() is None:
-                wlog.warning(f"[{account_name}] Connection lost before {ctype} — reconnecting...")
+            acc_pre = mt5.account_info()
+            if acc_pre is None or acc_pre.login != cfg["account"]:
+                if acc_pre and acc_pre.login != cfg["account"]:
+                    wlog.warning(
+                        f"[{account_name}] ⚠️ Wrong account #{acc_pre.login} "
+                        f"(expected #{cfg['account']}) before {ctype} — reconnecting"
+                    )
+                    mt5.shutdown()
+                else:
+                    wlog.warning(f"[{account_name}] Connection lost before {ctype} — reconnecting...")
                 if not _connect():
                     wlog.error(f"[{account_name}] Reconnect failed — dropping {ctype}")
                     continue
