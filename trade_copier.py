@@ -950,6 +950,15 @@ Rules:
             )
             data = await resp.json()
 
+        # Handle API-level errors (invalid key, billing, rate limit, etc.)
+        if "error" in data:
+            err = data["error"]
+            log.warning(f"  ⚠️ AI API error [{err.get('type','?')}]: {err.get('message','?')} — falling back to regex")
+            return None
+        if "content" not in data:
+            log.warning(f"  ⚠️ AI unexpected response (no 'content' key): {str(data)[:120]} — falling back to regex")
+            return None
+
         raw = data["content"][0]["text"].strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
