@@ -307,7 +307,7 @@ def _worker_main(cfg: dict, cmd_queue: mp.Queue, result_queue: mp.Queue,
             login=cfg["account"],
             password=cfg["password"],
             server=cfg["server"],
-            timeout=40000,
+            timeout=60000,
         ) and _verify("launch"):
             return True
 
@@ -840,7 +840,7 @@ class WorkerManager:
         responses = 0
         succeeded = 0
         failed    = 0
-        deadline  = time.monotonic() + 60
+        deadline  = time.monotonic() + 90   # 90 s — some terminals need 60+ s to initialize
         while responses < expected and time.monotonic() < deadline:
             try:
                 msg = self._result_q.get(timeout=2)
@@ -1372,30 +1372,14 @@ async def handler(event):
                 ))
 
 
-# ─────────────────────────────────────────────
-#  STALE TERMINAL CLEANUP
-# ─────────────────────────────────────────────
 def _kill_stale_mt5_terminals():
-    """
-    On Windows, MT5 terminal64.exe processes persist after the Python script
-    exits (Ctrl+C).  Re-launching the same terminal path on the next run fails
-    because MT5 won't start a second instance of the same executable.
-    Kill all terminal64.exe processes before spawning workers so every worker
-    gets a clean launch.
-    """
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["taskkill", "/F", "/IM", "terminal64.exe"],
-            capture_output=True, text=True
-        )
-        if "SUCCESS" in result.stdout:
-            log.info("  🧹 Closed stale MT5 terminal(s) from previous run")
-        else:
-            log.info("  🧹 No stale MT5 terminals found (clean start)")
-        time.sleep(2)   # give Windows time to fully release the process handles
-    except Exception as e:
-        log.warning(f"  ⚠️ Could not clean stale terminals: {e}")
+    # Intentionally a no-op. Do NOT kill terminal64.exe processes.
+    # The two-step _connect() (Step A: attach to running, Step B: launch)
+    # already handles terminals left open from a previous run by attaching
+    # to them. Killing them with taskkill forces a full relaunch and causes
+    # IPC timeout failures, especially for terminals that need extra time
+    # to initialize (Vantage, Exness).
+    log.info("  ℹ️ Terminal cleanup skipped — existing terminals will be reused")
 
 
 # ─────────────────────────────────────────────
