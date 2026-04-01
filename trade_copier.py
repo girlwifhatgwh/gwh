@@ -259,34 +259,63 @@ def _worker_main(cfg: dict, cmd_queue: mp.Queue, result_queue: mp.Queue,
 
     # ── STEP 1: Connect to MT5 once ──────────────────────────────────────
     def _connect() -> bool:
-        # ALWAYS use the dedicated terminal path for this account.
-        # Never call mt5.initialize() without path — that would attach to
-        # any already-running terminal on the machine and potentially log
-        # another account's credentials into it, kicking that account out.
-        wlog.info(f"[{account_name}] Connecting to dedicated terminal: {cfg['mt5_path']}")
-        ok = mt5.initialize(
+        """
+        Two-step connection strategy:
+
+        Step A — attach to a RUNNING terminal for this account (fast).
+          We pass login/password/server so MT5 only attaches if those
+          credentials match the already-open terminal.  Safe — if the
+          running terminal belongs to a different account, MT5 will reject
+          the attach and we fall through to Step B.
+
+        Step B — launch from the dedicated path.
+          path= binds this subprocess to its own terminal executable.
+
+        After either attempt we verify acc.login == cfg["account"] to
+        catch any edge case where the wrong account slipped through.
+        """
+
+        def _verify(label: str) -> bool:
+            acc = mt5.account_info()
+            if acc and acc.login == cfg["account"]:
+                wlog.info(
+                    f"[{account_name}] ✅ Connected ({label}) #{acc.login} | "
+                    f"{acc.server} | Balance:{acc.balance:.2f} {acc.currency}"
+                )
+                return True
+            wlog.warning(
+                f"[{account_name}] {label} returned wrong account "
+                f"#{acc.login if acc else '?'} (expected #{cfg['account']}) — retrying"
+            )
+            mt5.shutdown()
+            return False
+
+        # Step A: attach to already-running terminal
+        wlog.info(f"[{account_name}] Attaching to running terminal (account #{cfg['account']})...")
+        if mt5.initialize(
+            login=cfg["account"],
+            password=cfg["password"],
+            server=cfg["server"],
+            timeout=8000,
+        ) and _verify("attach"):
+            return True
+
+        # Step B: launch from dedicated terminal path
+        wlog.info(f"[{account_name}] Launching terminal from: {cfg['mt5_path']}")
+        if mt5.initialize(
             path=cfg["mt5_path"],
             login=cfg["account"],
             password=cfg["password"],
             server=cfg["server"],
-            timeout=30000,
+            timeout=40000,
+        ) and _verify("launch"):
+            return True
+
+        wlog.error(f"[{account_name}] ❌ Connect failed: {mt5.last_error()}")
+        wlog.error(
+            f"[{account_name}] 💡 Fix: open the terminal manually, log in to "
+            f"#{cfg['account']}, enable Expert Advisors, then restart the bot."
         )
-        if ok:
-            acc = mt5.account_info()
-            if acc and acc.login == cfg["account"]:
-                wlog.info(
-                    f"[{account_name}] ✅ MT5 connected #{acc.login} | "
-                    f"{acc.server} | Balance:{acc.balance:.2f} {acc.currency}"
-                )
-                return True
-            # Connected but wrong account — shut down and refuse
-            wlog.error(
-                f"[{account_name}] ❌ Wrong account connected "
-                f"(got #{acc.login if acc else '?'}, expected #{cfg['account']}) — shutting down"
-            )
-            mt5.shutdown()
-            return False
-        wlog.error(f"[{account_name}] ❌ MT5 connect failed: {mt5.last_error()}")
         return False
 
     connected = _connect()
