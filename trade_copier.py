@@ -806,22 +806,28 @@ class WorkerManager:
             self._slave_map.setdefault(master_acc, []).append(name)
 
         # Wait for all startups
-        expected = sum(1 for c in MASTER_ACCOUNTS.values() if c.get("enabled", True)) + \
-                   sum(1 for c in SLAVE_ACCOUNTS.values()   if c.get("enabled", True))
-        started = 0
-        deadline = time.monotonic() + 60   # 60 s to start all workers
-        while started < expected and time.monotonic() < deadline:
+        expected  = sum(1 for c in MASTER_ACCOUNTS.values() if c.get("enabled", True)) + \
+                    sum(1 for c in SLAVE_ACCOUNTS.values()   if c.get("enabled", True))
+        responses = 0
+        succeeded = 0
+        failed    = 0
+        deadline  = time.monotonic() + 60
+        while responses < expected and time.monotonic() < deadline:
             try:
                 msg = self._result_q.get(timeout=2)
                 if msg["type"] == "startup_ok":
                     log.info(f"  ✅ Worker [{msg['name']}] #{msg['account']} ready")
-                    started += 1
+                    succeeded += 1
                 elif msg["type"] == "startup_failed":
-                    log.error(f"  ❌ Worker startup failed for #{msg['account']}")
-                    started += 1   # count it so we don't hang forever
+                    log.error(f"  ❌ Worker startup FAILED for #{msg['account']} — check worker_*.log for details")
+                    failed += 1
+                responses += 1
             except Exception:
                 pass
-        log.info(f"  Workers ready: {started}/{expected}")
+        if failed == 0:
+            log.info(f"  ✅ All {succeeded}/{expected} workers connected")
+        else:
+            log.warning(f"  ⚠️ Workers: {succeeded} connected, {failed} FAILED (check worker logs)")
 
     def _start_worker(self, name: str, cfg: dict, is_slave: bool):
         q = mp.Queue()
@@ -1338,6 +1344,32 @@ async def handler(event):
 
 
 # ─────────────────────────────────────────────
+#  STALE TERMINAL CLEANUP
+# ─────────────────────────────────────────────
+def _kill_stale_mt5_terminals():
+    """
+    On Windows, MT5 terminal64.exe processes persist after the Python script
+    exits (Ctrl+C).  Re-launching the same terminal path on the next run fails
+    because MT5 won't start a second instance of the same executable.
+    Kill all terminal64.exe processes before spawning workers so every worker
+    gets a clean launch.
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", "terminal64.exe"],
+            capture_output=True, text=True
+        )
+        if "SUCCESS" in result.stdout:
+            log.info("  🧹 Closed stale MT5 terminal(s) from previous run")
+        else:
+            log.info("  🧹 No stale MT5 terminals found (clean start)")
+        time.sleep(2)   # give Windows time to fully release the process handles
+    except Exception as e:
+        log.warning(f"  ⚠️ Could not clean stale terminals: {e}")
+
+
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 async def main():
@@ -1355,6 +1387,11 @@ async def main():
     for cfg in MASTER_ACCOUNTS.values():
         d = os.path.dirname(cfg["json_file"])
         if d: os.makedirs(d, exist_ok=True)
+
+    # Kill any stale MT5 terminal processes left over from a previous run.
+    # Without this, restarting the script fails because MT5 refuses to launch
+    # a second instance of the same terminal64.exe that is still running.
+    _kill_stale_mt5_terminals()
 
     # Start all account worker subprocesses
     log.info("  Spawning per-account MT5 worker subprocesses...")
